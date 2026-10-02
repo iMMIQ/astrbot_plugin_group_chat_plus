@@ -6,6 +6,8 @@ import json
 import time
 import uuid
 
+from .poke import notice as poke_notice
+
 
 def room_key(event):
     return json.dumps([str(event.get_platform_id()), str(event.get_self_id()),
@@ -113,6 +115,8 @@ class PlatformAdapter:
                 result.append({"type": "forward", "nodes": output, "available": bool(output)})
             elif kind == "face":
                 result.append({"type": "text", "text": "[QQ表情 id=" + str(field(part, "id", "")) + "]"})
+            elif kind == "poke" and (poke := poke_notice(event)):
+                result.append(poke)
             else:
                 result.append({"type": "unavailable", "kind": kind, "reason": "unsupported_modality"})
         return result
@@ -128,5 +132,6 @@ class PlatformAdapter:
             return existing, False
         # Reserve a local arrival time before bounded quote/forward resolution.
         received = time.time()
-        parts = await self.normalize(event, event.get_messages(), room)
+        poke = poke_notice(event)
+        parts = [poke] if poke else await self.normalize(event, event.get_messages(), room)
         return self.journal.add(room, eid, event.get_sender_id(), event.get_sender_name(), parts, received=received)

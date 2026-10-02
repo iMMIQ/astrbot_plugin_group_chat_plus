@@ -11,7 +11,7 @@ import time
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
-from astrbot.core.agent.message import Message
+from astrbot.core.agent.message import Message, TextPart
 from astrbot.core.provider.entities import ProviderRequest
 from astrbot.core.star.star_handler import star_handlers_registry
 from astrbot.core.star.star_tools import StarTools
@@ -20,6 +20,7 @@ from .multimodal.adapter import PlatformAdapter, image_ids, part_type, room_key
 from .multimodal.bridge import GROUP_RULES, additions, protocol_messages, request_snapshot, restore_legacy_wrappers, rewrite
 from .multimodal.context import ContextLimit, ContextSelector
 from .multimodal.media import MediaStore
+from .multimodal.poke import accepted as accept_poke, in_scope as poke_scope, notice as poke_notice, probability, send as send_poke
 from .multimodal.runner import execute, strict_provider
 from .multimodal.store import Journal
 
@@ -46,7 +47,7 @@ class ChatPlus(Star):
         await self.media.start()
         restored = restore_legacy_wrappers(star_handlers_registry)
         self.cleanup_task = asyncio.create_task(self._cleanup())
-        logger.info("[NativeMM] v2.0.1 原图上下文已加载；旧钩子包装恢复=%s，主动参与=%s",
+        logger.info("[NativeMM] v2.0.2 原图上下文已加载；旧钩子包装恢复=%s，主动参与=%s",
                     restored, bool(self.config.get("auto_reply_enabled", False)))
 
     async def _cleanup(self):
@@ -80,10 +81,29 @@ class ChatPlus(Star):
     async def capture(self, event: AstrMessageEvent):
         if not self._enabled(event):
             return
+        poke = poke_notice(event)
+        raw = getattr(event.message_obj, "raw_message", None)
+        if poke:
+            if not accept_poke(self.config, event, poke):
+                return
+        elif hasattr(raw, "get") and raw.get("post_type") == "notice":
+            return
         event.set_extra("_group_context_flow_injected", True)
         anchor, inserted = await self.adapter.ingest(event)
         event.set_extra(OWNER + "_anchor", anchor)
         event.set_extra(OWNER + "_duplicate", not inserted)
+        if poke and poke["target_id"] == str(event.get_self_id()):
+            # Real notices have an empty message string and no @ segment. Handle
+            # before the framework's empty-message/wake checks, like pure @.
+            event.is_at_or_wake_command = True
+            if inserted and random.random() < probability(self.config, "poke_reverse_on_poke_probability", 0.0):
+                if await self._poke(event, anchor, "reverse"):
+                    event.set_extra(OWNER + "_reverse_poke", True)
+            async with contextlib.aclosing(self._reply(event, anchor)) as flow:
+                async for result in flow:
+                    yield result
+            event.stop_event()
+            return
         messages = event.get_messages()
         # Own pure @ before the builtin group waiter can capture another user.
         if (len(messages) == 1 and part_type(messages[0]) == "at"
@@ -174,9 +194,14 @@ class ChatPlus(Star):
                     return
                 event.set_extra(OWNER, {"selection": selection, "gid": gid, "leased": leased,
                                         "provider": provider, "auto": auto})
-                text = "\n".join(p["text"] for p in anchor["parts"] if p["type"] == "text").strip() or "[仅附件或@消息]"
+                text = "\n".join(p["text"] for p in anchor["parts"] if p["type"] == "text").strip()
+                if not text:
+                    poke = next((p for p in anchor["parts"] if p["type"] == "poke"), None)
+                    text = "[戳一戳事件=" + json.dumps(poke, ensure_ascii=False) + "]" if poke else "[仅附件或@消息]"
                 event.set_extra(OWNER + "_retrieval", text)
                 request = event.request_llm(prompt=text, contexts=[], conversation=await self._conversation(event))
+                if event.get_extra(OWNER + "_reverse_poke", False):
+                    request.extra_user_content_parts.append(TextPart(text="[平台动作]机器人已向本轮戳人者戳回一次，此动作已成功执行。"))
                 async with contextlib.aclosing(execute(event, self.context, request, provider)) as execution:
                     async for _ in execution:
                         yield None
@@ -261,12 +286,32 @@ class ChatPlus(Star):
         result = event.get_result()
         if state and result and result.is_model_result():
             self.journal.sent(state["gid"])
+            if not state.get("after_poke_attempted"):
+                state["after_poke_attempted"] = True
+                if (self.config.get("enable_poke_after_reply", True) and poke_scope(self.config, event)
+                        and random.random() < probability(self.config, "poke_after_reply_probability", 0.15)):
+                    await asyncio.sleep(max(0.0, float(self.config.get("poke_after_reply_delay", 0.5))))
+                    if not self.closing:
+                        await self._poke(event, state["selection"].anchor, "after_reply", state["gid"])
+
+    async def _poke(self, event, anchor, reason, generation=None):
+        try:
+            if not self.closing and await send_poke(event, anchor["sender"]):
+                self.journal.add(anchor["room"], "poke:" + (generation or anchor["event_id"]) + ":" + reason,
+                                 event.get_self_id(), "bot",
+                                 [{"type": "poke", "actor_id": str(event.get_self_id()), "target_id": anchor["sender"]}],
+                                 kind="action")
+                logger.info("[NativeMM] 戳一戳已执行 reason=%s", reason)
+                return True
+        except Exception as exc:
+            logger.warning("[NativeMM] 戳一戳失败 type=%s", type(exc).__name__)
+        return False
 
     @filter.command("mmstatus")
     async def status(self, event):
         if not self._enabled(event):
             return
-        yield event.plain_result("NativeMM v2.0.1\n" + json.dumps(self.journal.status(room_key(event)), ensure_ascii=False))
+        yield event.plain_result("NativeMM v2.0.2\n" + json.dumps(self.journal.status(room_key(event)), ensure_ascii=False))
         event.stop_event()
 
     @filter.command("mmreset")

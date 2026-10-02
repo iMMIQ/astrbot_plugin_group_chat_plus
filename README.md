@@ -2,7 +2,7 @@
 
 面向原生图片模型的 AstrBot 群聊插件，基于 Him666233 的 [Chat Plus](https://github.com/Him666233/astrbot_plugin_group_chat_plus) 重写运行入口。保留 AGPL-3.0 许可证和上游署名。
 
-**v2.0.1：消息先保存，图片直接进模型上下文。** A 发图、B 插话、A 再 @ 提问时，图片留在 A 的原消息里；不先转述，不依赖平台 caption，不把所有群历史拼进一个大 prompt。
+**v2.0.2：消息先保存，图片直接进模型上下文。** A 发图、B 插话、A 再 @ 提问时，图片留在 A 的原消息里；不先转述，不依赖平台 caption，不把所有群历史拼进一个大 prompt。
 
 ## 已实现
 
@@ -10,6 +10,7 @@
 - 原始图片托管、内容哈希去重、重启恢复、TTL、磁盘配额和请求租约。
 - 当前消息、明确引用、同人近期图片、最近群聊的分层选择；真实 user/assistant/tool 角色。
 - 明确 @ / 回复 bot / 框架唤醒直接生成；纯 @ 最多等待 1 秒收同人的后续消息。
+- QQ 群真实戳机器人通知直接唤醒；可配置即时反戳和回复后戳人，动作进入群日志。普通文本无法伪造戳一戳通知。
 - 每房间生成串行、平台消息与生成去重；完整工具轮次记录，分段发送与生成全文分开。
 - 人格、KB、工具、常规请求扩展保留；基于 AstrBot 原生 Agent 构建/执行/发送钩子。
 - OpenAI 兼容提供商采用独立请求对象阻止“图片失败后去图重试”，不修改全局提供商。
@@ -43,6 +44,9 @@ WebUI 中仍使用唯一插件名 `astrbot_plugin_group_chat_plus`，显示为 *
 | `room_media_mib` / `total_media_mib` | 256 / 1024 | 单群软配额 / 实例硬配额 |
 | `auto_reply_enabled` | false | 允许主动插话 |
 | `auto_candidate_probability` / `auto_reply_cooldown` | 0.02 / 60 | 主动候选概率 / 硬冷却秒数 |
+| `poke_message_mode` / `poke_enabled_groups` | bot_only / `[]` | 戳机器人直接唤醒；all 同时记录成员互戳；ignore 忽略。群名单为空表示插件管理的全部群 |
+| `poke_reverse_on_poke_probability` | 0 | 收到戳机器人通知时立即反戳；失败不阻断模型回复 |
+| `enable_poke_after_reply` / `poke_after_reply_probability` / `poke_after_reply_delay` | true / 0.15 / 0.5 | 模型回复送出后最多戳一次触发者；概率 / 延迟秒数 |
 
 预算估算保守，并给模型输出留空间；人格和工具本身超过预算时会明确提示。当前问题与关联附件超限时要求分批提问，不悄悄丢掉问题对象。
 
@@ -74,5 +78,7 @@ python tests/multimodal/sdk_probe.py "$PWD"
 ```
 
 SDK 探针使用临时日志和离线模型，调用真实框架构建、钩子和工具循环，不加载生产插件配置、不发送群消息。已通过组件测试、SDK 探针，以及当前 GLM 的红/蓝测试图多图识别。热刷新后的真实 QQ 收发由使用者在测试群确认。
+
+戳一戳仅适配 QQ 群 OneBot `notice/notify/poke`。必须核对平台、群、bot 和发送者身份；戳机器人属于明确唤醒，不受主动插话概率或冷却限制。`all` 模式下成员互戳可进入群日志，是否插话沿用主动插话门控。重复的发送回调不重复戳人，机器人自己的戳人通知不产生回复循环。`send_poke` 使用原群号和触发者 ID，限时 2 秒，失败只记录诊断。
 
 [架构设计](docs/MULTIMODAL_DESIGN.md) · [实施验收](docs/MULTIMODAL_PLAN.md) · [协议示例](docs/examples/multimodal-context.json) · [原始上游说明](docs/UPSTREAM_README.md)

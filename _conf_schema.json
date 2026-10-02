@@ -98,5 +98,36 @@
     "description": "主动候选检查的硬冷却（秒）",
     "type": "int",
     "default": 60
+  },
+  "poke_message_mode": {
+    "description": "QQ 群戳一戳：bot_only 仅接收戳机器人（明确唤醒）；all 同时记录成员互戳；ignore 忽略",
+    "type": "string",
+    "options": ["bot_only", "all", "ignore"],
+    "default": "bot_only"
+  },
+  "poke_enabled_groups": {
+    "description": "戳一戳启用群号；空列表表示插件管理的所有群",
+    "type": "list",
+    "default": []
+  },
+  "poke_reverse_on_poke_probability": {
+    "description": "收到戳机器人时立即反戳的概率（0 到 1）；不影响正常文字回复",
+    "type": "float",
+    "default": 0.0
+  },
+  "enable_poke_after_reply": {
+    "description": "QQ 群模型回复送出后，有概率戳本轮触发者；每轮最多一次",
+    "type": "bool",
+    "default": true
+  },
+  "poke_after_reply_probability": {
+    "description": "回复后戳一戳的概率（0 到 1）",
+    "type": "float",
+    "default": 0.15
+  },
+  "poke_after_reply_delay": {
+    "description": "回复后戳一戳的延迟（秒）",
+    "type": "float",
+    "default": 0.5
   }
 }

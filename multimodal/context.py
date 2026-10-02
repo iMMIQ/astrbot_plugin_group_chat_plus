@@ -108,6 +108,9 @@ class ContextSelector:
                 output.append({"type": "text", "text": "[mention_id=" + json.dumps(part["target_id"], ensure_ascii=False) + "]"})
             elif kind == "reply":
                 output.append({"type": "text", "text": "[reply_to=" + json.dumps(part["event_id"], ensure_ascii=False) + "]"})
+            elif kind == "poke":
+                output.append({"type": "text", "text": "[戳一戳事件=" + json.dumps(
+                    {"actor_id": part["actor_id"], "target_id": part["target_id"]}, ensure_ascii=False) + "]"})
             elif kind == "forward":
                 output.append({"type": "text", "text": "[合并转发开始]" if part["available"] else "[合并转发内容无法获取]"})
                 for node in part["nodes"]:

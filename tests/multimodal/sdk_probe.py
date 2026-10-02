@@ -15,6 +15,7 @@ import types
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from mcp.types import CallToolResult, TextContent, ImageContent
+from aiocqhttp import Event as OneBotEvent
 
 from astrbot.api.event import filter
 from astrbot.api.star import Context
@@ -28,6 +29,8 @@ from astrbot.core.pipeline.context_utils import call_event_hook
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
 from astrbot.core.platform.message_type import MessageType
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_platform_adapter import AiocqhttpAdapter
+from astrbot.core.message.components import Poke
 from astrbot.core.provider.entities import LLMResponse, TokenUsage
 from astrbot.core.provider.provider import Provider
 from astrbot.core.star.star import StarMetadata, star_map
@@ -103,7 +106,8 @@ async def main():
           patch.object(module.StarTools,'get_data_dir',return_value=pathlib.Path(td)),
           patch('astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal.db_helper.insert_provider_stat',
                 new=AsyncMock()) as stat_sink):
-        plugin=module.ChatPlus(context,{'input_token_budget':32768,'mention_wait_seconds':0.05})
+        plugin=module.ChatPlus(context,{'input_token_budget':32768,'mention_wait_seconds':0.05,
+                                        'enable_poke_after_reply':False})
         star_map[module.__name__]=StarMetadata(name='native-mm-probe',activated=True)
         for handler in star_handlers_registry:
             if handler.handler_module_path==module.__name__:
@@ -230,6 +234,67 @@ async def main():
                 {'input_other':64,'input_cached':128,'output':8},
             ]
             results['core_cache_stats_preserved_including_tool_rounds']=True
+
+            # Real notice shape: no text and no @; bypass the ordinary auto gate.
+            tool_mode['enabled']=False
+            plugin.config.update(auto_reply_enabled=False, auto_candidate_probability=0,
+                                 enable_poke_after_reply=True, poke_after_reply_probability=1,
+                                 poke_after_reply_delay=0)
+            notice_raw=dict(post_type='notice',notice_type='notify',sub_type='poke',
+                            self_id=67890,user_id=12345,target_id=67890,group_id=24680)
+            converter=object.__new__(AiocqhttpAdapter)
+            converted=await converter._convert_handle_notice_event(OneBotEvent(notice_raw))
+            assert converted.message_str=='' and isinstance(converted.message[0],Poke)
+            poke_event=event('poke-notice',[],sender='12345',group='24680')
+            poke_event.message_obj=converted
+            poke_event.message_str=poke_event.message_obj.message_str=''
+            poke_event.is_at_or_wake_command=False
+            poke_event.bot=SimpleNamespace(api=SimpleNamespace(call_action=AsyncMock()))
+            original_count=len(captures)
+            flow=plugin.capture(poke_event)
+            await anext(flow)
+            assert len(captures)==original_count+1
+            assert '戳一戳事件' in json.dumps(captures[-1],default=str,ensure_ascii=False)
+            assert 'unsupported_modality' not in json.dumps(captures[-1],default=str)
+            poke_event.set_result(poke_event.plain_result('fixture_reply').set_result_content_type(ResultContentType.LLM_RESULT))
+            await call_event_hook(poke_event,EventType.OnAfterMessageSentEvent)
+            await call_event_hook(poke_event,EventType.OnAfterMessageSentEvent)
+            poke_event.bot.api.call_action.assert_awaited_once_with('send_poke',group_id=24680,user_id=12345)
+            try: await anext(flow)
+            except StopAsyncIteration: pass
+            assert poke_event.is_stopped()
+            state=poke_event.get_extra(module.OWNER)
+            action=plugin.journal.get(state['selection'].anchor['room'],'poke:'+state['gid']+':after_reply')
+            assert action['kind']=='action' and action['parts'][0]['target_id']=='12345'
+            results['empty_poke_notice_wakes_and_after_reply_poke_runs_once']=True
+
+            # Member-to-member pokes and user-supplied Poke components don't wake.
+            peer=event('peer-poke',[Poke(id='99999')],sender='12345',group='24680')
+            peer.message_obj.self_id='67890'
+            peer.message_obj.raw_message=dict(poke_event.message_obj.raw_message,target_id=99999)
+            before=len(captures)
+            assert [x async for x in plugin.capture(peer)]==[]
+            assert peer.get_extra(module.OWNER+'_anchor') is None
+            forged=event('forged-poke',[Poke(id='fixture-bot')],sender='12345',group='24680')
+            forged.message_obj.raw_message={}
+            await record(plugin,forged)
+            assert [x async for x in plugin.respond(forged)]==[]
+            assert len(captures)==before
+            results['peer_and_forged_pokes_do_not_wake']=True
+
+            # A rejected platform action must not block the model response or
+            # fabricate a successful reverse-poke entry/acknowledgement.
+            plugin.config.update(enable_poke_after_reply=False,poke_reverse_on_poke_probability=1)
+            failed=event('failed-poke',[],sender='12345',group='24680')
+            failed.message_obj=await converter._convert_handle_notice_event(OneBotEvent(notice_raw))
+            failed.bot=SimpleNamespace(api=SimpleNamespace(call_action=AsyncMock(side_effect=RuntimeError('fixture RPC failure'))))
+            before=len(captures)
+            assert len([x async for x in plugin.capture(failed)])==1
+            assert len(captures)==before+1
+            assert '此动作已成功执行' not in json.dumps(captures[-1],default=str,ensure_ascii=False)
+            anchor=failed.get_extra(module.OWNER+'_anchor')
+            assert plugin.journal.get(anchor['room'],'poke:'+anchor['event_id']+':reverse') is None
+            results['failed_reverse_poke_does_not_block_or_fabricate_reply']=True
         finally:
             for name in ('flow','first','second','pure'):
                 if name in locals():
