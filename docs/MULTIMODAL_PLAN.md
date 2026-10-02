@@ -1,6 +1,6 @@
 # 多模态分支实施与验收计划
 
-状态：待实现。设计依据与行为约定见 [MULTIMODAL_DESIGN.md](MULTIMODAL_DESIGN.md)。
+状态：保留原始验收计划；v2.0.0 实现与已通过项目见 [实现记录](MULTIMODAL_RELEASE.md)。设计依据与行为约定见 [MULTIMODAL_DESIGN.md](MULTIMODAL_DESIGN.md)。
 
 ## 阶段 0：当前交付
 
