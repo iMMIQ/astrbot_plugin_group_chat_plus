@@ -24,6 +24,16 @@ class MediaStore:
         self.write_lock = asyncio.Lock()
         self.session = None
 
+    @staticmethod
+    async def _io(function, *args, **kwargs):
+        operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            # Finish an in-flight file write/read before releasing its lifetime.
+            await operation
+            raise
+
     async def start(self):
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
 
@@ -54,17 +64,18 @@ class MediaStore:
             encoded = source.split(",", 1)[1] if source.startswith("data:") else source[9:]
             if len(encoded) > (limit + 2) // 3 * 4:
                 raise ValueError("image_too_large")
-            data = await asyncio.to_thread(base64.b64decode, encoded, validate=True)
+            data = await self._io(base64.b64decode, encoded, validate=True)
         else:
             path = Path(unquote(urlparse(source).path)) if source.startswith("file://") else Path(source)
-            if await asyncio.to_thread(lambda: path.stat().st_size) > limit:
+            if await self._io(lambda: path.stat().st_size) > limit:
                 raise ValueError("image_too_large")
-            data = await asyncio.to_thread(path.read_bytes)
+            data = await self._io(path.read_bytes)
         if len(data) > limit:
             raise ValueError("image_too_large")
         return data
 
     async def _capture(self, mid, source):
+        tmp = None
         try:
             async with self.semaphore:
                 data = await self._read(source)
@@ -77,19 +88,19 @@ class MediaStore:
                         raise ValueError("unsupported_image")
                     return size, Image.MIME[fmt]
 
-                (width, height), mime = await asyncio.to_thread(inspect)
-                sha = await asyncio.to_thread(lambda: hashlib.sha256(data).hexdigest())
+                (width, height), mime = await self._io(inspect)
+                sha = await self._io(lambda: hashlib.sha256(data).hexdigest())
                 room = (await self.journal.media(mid))["room"]
                 bucket = self.root / hashlib.sha256(room.encode()).hexdigest()[:24]
-                await asyncio.to_thread(bucket.mkdir, parents=True, exist_ok=True)
+                await self._io(bucket.mkdir, parents=True, exist_ok=True)
                 path = bucket / sha
                 async with self.write_lock:
-                    if not await asyncio.to_thread(path.exists):
+                    if not await self._io(path.exists):
                         if not await self._make_space(len(data), room):
                             raise ValueError("media_quota_exceeded")
                         tmp = bucket / (mid + ".tmp")
-                        await asyncio.to_thread(tmp.write_bytes, data)
-                        await asyncio.to_thread(tmp.replace, path)
+                        await self._io(tmp.write_bytes, data)
+                        await self._io(tmp.replace, path)
                     await self.journal.media_update(
                         mid,
                         status="ready",
@@ -113,13 +124,16 @@ class MediaStore:
                 else type(exc).__name__
             )
             await self.journal.media_update(mid, status="failed", error=reason)
+        finally:
+            if tmp is not None:
+                await self._io(tmp.unlink, missing_ok=True)
 
     async def _expire_path(self, path):
         mids = await self.journal.asset_refs(path)
         if any(self.leases[mid] for mid in mids):
             return False
         try:
-            await asyncio.to_thread(Path(path).unlink, missing_ok=True)
+            await self._io(Path(path).unlink, missing_ok=True)
         except OSError:
             return False
         await self.journal.expire_asset(path)
@@ -159,11 +173,11 @@ class MediaStore:
         if not media or media["status"] != "ready":
             return None
         try:
-            data = await asyncio.to_thread(Path(media["path"]).read_bytes)
+            data = await self._io(Path(media["path"]).read_bytes)
         except OSError:
             await self.journal.expire_asset(media["path"])
             return None
-        encoded = await asyncio.to_thread(lambda: base64.b64encode(data).decode())
+        encoded = await self._io(lambda: base64.b64encode(data).decode())
         return f"data:{media['mime']};base64," + encoded
 
     async def cleanup(self):

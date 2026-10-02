@@ -409,11 +409,11 @@ class SQLiteRepository:
                 WHEN sent_parts>0 THEN 'partial'
                 WHEN EXISTS(SELECT 1 FROM deliveries WHERE generation=generations.id AND status!='sent') THEN 'uncertain'
                 WHEN ? THEN 'none' ELSE 'uncertain' END,
-                pipeline_complete=? WHERE id=? AND status='generated'""",
+                pipeline_complete=? WHERE id=? AND status IN ('running','generated','failed')""",
                 (completed, completed, completed, gid),
             )
             self.db.execute(
-                "UPDATE generations SET status='failed',delivery='uncertain' WHERE id=? AND status='running'",
+                "UPDATE generations SET status='failed' WHERE id=? AND status='running'",
                 (gid,),
             )
 

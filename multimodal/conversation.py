@@ -295,8 +295,11 @@ class ConversationService:
             raise
         except Exception as exc:
             self.logger.error("[NativeMM] 回复失败 type=%s", type(exc).__name__, exc_info=True)
+            if gid:
+                await self.journal.finish(gid, "failed")
             if not auto:
                 yield event.plain_result("群聊上下文处理失败，请查看 NativeMM 日志。")
+            completed = True
         finally:
             if state and state.transport:
                 state.transport.restore()

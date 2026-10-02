@@ -325,3 +325,41 @@ async def test_send_failure_cannot_be_reported_as_sent_on_normal_pipeline_end(st
     status = (await journal.status("room"))["last_generation"]
     assert status["delivery"] == "partial"
     assert status["sent_parts"] == 1
+
+
+@pytest.mark.parametrize("finish,complete,delivery", [("failed", True, "sent"), (None, False, "partial")])
+async def test_generation_failure_does_not_erase_known_delivery(state, finish, complete, delivery):
+    journal, media, selector = state
+    anchor = await member(journal, "question")
+    gid = await journal.begin("room", anchor["seq"])
+    if finish:
+        await journal.finish(gid, finish)
+    await journal.delivery_attempt(gid, "receipt")
+    await journal.sent(gid, "receipt")
+    await journal.settle(gid, completed=complete)
+    last = (await journal.status("room"))["last_generation"]
+    assert last["generation_status"] == "failed"
+    assert last["delivery"] == delivery
+
+
+async def test_cancelled_asset_io_finishes_before_refresh_cleanup():
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def write():
+        started.set()
+        release.wait(2)
+        finished.set()
+
+    operation = asyncio.create_task(MediaStore._io(write))
+    await asyncio.to_thread(started.wait)
+    operation.cancel()
+    await asyncio.sleep(0.01)
+    assert not operation.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+    assert finished.is_set()
