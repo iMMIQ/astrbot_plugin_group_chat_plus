@@ -30,7 +30,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: '3.12'
-      - run: uv sync --locked --no-dev
+      - run: uv sync --no-dev
         working-directory: framework
       - name: Offline contract against the real core
         working-directory: framework
