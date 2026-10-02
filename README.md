@@ -1,5 +1,7 @@
 # 群聊增强插件 (Chat Plus)
 
+> **本 fork 的多模态设计分支**：面向原生图片输入重新设计群聊上下文，详见[多模态设计](docs/MULTIMODAL_DESIGN.md)、[实施与验收计划](docs/MULTIMODAL_PLAN.md)和[上下文示例](docs/examples/multimodal-context.json)。当前提交只包含设计文档，运行逻辑仍为上游实现。下方说明保留上游版本的行为与署名，不代表新设计已经实现。
+
 ---
 
 <div align="center">

@@ -1,0 +1,89 @@
+{
+  "description": "设计示例，非运行配置；账号和消息为虚构。图片为结构验证用的 1×1 PNG。",
+  "logical_snapshot": {
+    "schema_version": 1,
+    "room_key": {
+      "platform_instance_id": "napcat-example",
+      "bot_account_id": "bot-example",
+      "chat_type": "group",
+      "chat_id": "group-example"
+    },
+    "anchor_event_id": "m103",
+    "snapshot_seq": 103,
+    "events": [
+      {
+        "event_id": "m101",
+        "seq": 101,
+        "received_at": "2026-10-02T10:00:00Z",
+        "actor": {"kind": "member", "id": "user-a", "display_name": "小甲"},
+        "parts": [{"type": "image", "media_id": "media-example-1"}]
+      },
+      {
+        "event_id": "m102",
+        "seq": 102,
+        "received_at": "2026-10-02T10:00:01Z",
+        "actor": {"kind": "member", "id": "user-b", "display_name": "小乙"},
+        "parts": [{"type": "text", "text": "我刚回来。"}]
+      },
+      {
+        "event_id": "m103",
+        "seq": 103,
+        "received_at": "2026-10-02T10:00:03Z",
+        "actor": {"kind": "member", "id": "user-a", "display_name": "小甲"},
+        "parts": [
+          {"type": "mention", "target_id": "bot-example"},
+          {"type": "text", "text": "这张图是什么颜色？"}
+        ]
+      }
+    ],
+    "media": [
+      {
+        "media_id": "media-example-1",
+        "status": "ready",
+        "mime_type": "image/png",
+        "width": 1,
+        "height": 1,
+        "storage_ref": "plugin-media://example-png",
+        "source_event_id": "m101"
+      }
+    ],
+    "selection": {
+      "event_ids": ["m101", "m102", "m103"],
+      "primary_media_ids": ["media-example-1"],
+      "reasons": {"m101": "same_sender_recent_image", "m102": "recent_room_context", "m103": "current_anchor"}
+    }
+  },
+  "wire_messages_example": [
+    {
+      "role": "system",
+      "content": "此处仅示意框架装配的人格与群聊规则。按消息元数据区分发送者；图片属于其所在消息。"
+    },
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "[event_id=m101; sender_id=user-a; name=小甲; time=2026-10-02T10:00:00Z; media_id=media-example-1]"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"}}
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "[event_id=m102; sender_id=user-b; name=小乙; time=2026-10-02T10:00:01Z]"},
+        {"type": "text", "text": "我刚回来。"}
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "[event_id=m103; sender_id=user-a; name=小甲; time=2026-10-02T10:00:03Z; mentions=bot-example]"},
+        {"type": "text", "text": "这张图是什么颜色？"}
+      ]
+    }
+  ],
+  "notes": [
+    "m101/m102 进入历史 contexts，m103 进入当前 user 内容；当前事件只发送一次。",
+    "storage_ref 是内部逻辑引用，必须在发送前解析成 provider 支持的图片输入。",
+    "模型看到的是内联原图，不是 [Image] 或 AI 转述；生产请求不要保存 data URI 到日志。",
+    "此例没有 assistant/tool 轮次；包含工具时必须保留真实角色和调用 ID。"
+  ]
+}
