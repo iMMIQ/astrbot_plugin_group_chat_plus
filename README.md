@@ -2,7 +2,7 @@
 
 面向原生图片模型的 AstrBot 群聊插件，基于 Him666233 的 [Chat Plus](https://github.com/Him666233/astrbot_plugin_group_chat_plus) 重写运行入口。保留 AGPL-3.0 许可证和上游署名。
 
-**v2.0.0：消息先保存，图片直接进模型上下文。** A 发图、B 插话、A 再 @ 提问时，图片留在 A 的原消息里；不先转述，不依赖平台 caption，不把所有群历史拼进一个大 prompt。
+**v2.0.1：消息先保存，图片直接进模型上下文。** A 发图、B 插话、A 再 @ 提问时，图片留在 A 的原消息里；不先转述，不依赖平台 caption，不把所有群历史拼进一个大 prompt。
 
 ## 已实现
 

@@ -10,7 +10,9 @@ from astrbot.core.astr_agent_run_util import run_agent
 from astrbot.core.astr_main_agent import build_main_agent, collect_initial_request
 from astrbot.core.pipeline.context import PipelineContext
 from astrbot.core.pipeline.context_utils import call_event_hook
-from astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal import InternalAgentSubStage
+from astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal import (
+    InternalAgentSubStage, _record_internal_agent_stats,
+)
 from astrbot.core.pipeline.process_stage.follow_up import register_active_runner, unregister_active_runner
 from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
 from astrbot.core.provider.entities import LLMResponse
@@ -102,6 +104,11 @@ async def execute(event, context, request, provider):
         if runner.done() and not event.get_extra("_native_multimodal_done", False):
             await runner.agent_hooks.on_agent_done(runner.run_context,
                                                    runner.get_final_llm_resp() or LLMResponse(role="tool", completion_text=""))
+        # The core stage normally records stats after consuming run_agent. Since
+        # we own that boundary, preserve its usage/cache accounting explicitly.
+        # This helper handles storage errors without affecting the response.
+        await _record_internal_agent_stats(event, built.provider_request, runner,
+                                           runner.get_final_llm_resp())
         if not event.is_stopped() or runner.was_aborted():
             await native._save_to_history(event, built.provider_request, runner.get_final_llm_resp(),
                                           runner.run_context.messages, runner.stats, user_aborted=runner.was_aborted())

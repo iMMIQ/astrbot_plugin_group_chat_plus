@@ -46,7 +46,7 @@ class ChatPlus(Star):
         await self.media.start()
         restored = restore_legacy_wrappers(star_handlers_registry)
         self.cleanup_task = asyncio.create_task(self._cleanup())
-        logger.info("[NativeMM] v2.0.0 原图上下文已加载；旧钩子包装恢复=%s，主动参与=%s",
+        logger.info("[NativeMM] v2.0.1 原图上下文已加载；旧钩子包装恢复=%s，主动参与=%s",
                     restored, bool(self.config.get("auto_reply_enabled", False)))
 
     async def _cleanup(self):
@@ -266,7 +266,7 @@ class ChatPlus(Star):
     async def status(self, event):
         if not self._enabled(event):
             return
-        yield event.plain_result("NativeMM v2.0.0\n" + json.dumps(self.journal.status(room_key(event)), ensure_ascii=False))
+        yield event.plain_result("NativeMM v2.0.1\n" + json.dumps(self.journal.status(room_key(event)), ensure_ascii=False))
         event.stop_event()
 
     @filter.command("mmreset")

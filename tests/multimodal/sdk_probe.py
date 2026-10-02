@@ -28,7 +28,7 @@ from astrbot.core.pipeline.context_utils import call_event_hook
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
 from astrbot.core.platform.message_type import MessageType
-from astrbot.core.provider.entities import LLMResponse
+from astrbot.core.provider.entities import LLMResponse, TokenUsage
 from astrbot.core.provider.provider import Provider
 from astrbot.core.star.star import StarMetadata, star_map
 from astrbot.core.star.star_handler import EventType, star_handlers_registry
@@ -73,8 +73,10 @@ async def main():
         if tool_mode['enabled'] and tool_mode['step']==0:
             tool_mode['step']+=1
             return LLMResponse(role='assistant',completion_text='',tools_call_name=['fixture_lookup'],
-                               tools_call_args=[{}],tools_call_ids=['call-fixture'])
-        return LLMResponse(role='assistant', completion_text='fixture_reply')
+                               tools_call_args=[{}],tools_call_ids=['call-fixture'],
+                               usage=TokenUsage(input_other=64,input_cached=128,output=8))
+        return LLMResponse(role='assistant', completion_text='fixture_reply',
+                           usage=TokenUsage(input_other=64,input_cached=128,output=8))
     provider.text_chat=AsyncMock(side_effect=reply)
     cfg=copy.deepcopy(DEFAULT_CONFIG)
     cfg['agent_runner']=normalize_agent_runner(cfg.get('agent_runner'))
@@ -97,7 +99,10 @@ async def main():
     context.conversation_manager=SimpleNamespace(get_curr_conversation_id=AsyncMock(return_value=conversation.cid),
                                                  get_conversation=AsyncMock(return_value=conversation),update_conversation=AsyncMock())
     results={}
-    with tempfile.TemporaryDirectory() as td, patch.object(module.StarTools,'get_data_dir',return_value=pathlib.Path(td)):
+    with (tempfile.TemporaryDirectory() as td,
+          patch.object(module.StarTools,'get_data_dir',return_value=pathlib.Path(td)),
+          patch('astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal.db_helper.insert_provider_stat',
+                new=AsyncMock()) as stat_sink):
         plugin=module.ChatPlus(context,{'input_token_budget':32768,'mention_wait_seconds':0.05})
         star_map[module.__name__]=StarMetadata(name='native-mm-probe',activated=True)
         for handler in star_handlers_registry:
@@ -215,6 +220,16 @@ async def main():
             else:
                 raise AssertionError('image removal allowed')
             results['image_removal_retry_blocked_without_global_mutation']=True
+            # Real core stats helper, mocked storage: no probe rows in production.
+            assert stat_sink.await_count==3
+            recorded=[call.kwargs for call in stat_sink.await_args_list]
+            assert all(row['provider_id']=='fixture-provider' and row['status']=='completed' for row in recorded)
+            assert [row['stats']['token_usage'] for row in recorded]==[
+                {'input_other':64,'input_cached':128,'output':8},
+                {'input_other':128,'input_cached':256,'output':16},
+                {'input_other':64,'input_cached':128,'output':8},
+            ]
+            results['core_cache_stats_preserved_including_tool_rounds']=True
         finally:
             for name in ('flow','first','second','pure'):
                 if name in locals():
