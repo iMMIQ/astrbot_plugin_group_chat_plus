@@ -1,13 +1,14 @@
-"""Selection is deterministic; the model resolves meaning from typed messages."""
+"""Causal selection and immutable event frames; images stay symbolic in SQLite."""
+
 from __future__ import annotations
 
 import copy
 import json
 import math
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from .adapter import image_ids
+from .adapters.onebot import image_ids
+from .models import Selection, event_order
 
 
 class ContextLimit(ValueError):
@@ -15,55 +16,47 @@ class ContextLimit(ValueError):
 
 
 def text_tokens(value):
-    # Conservative without a model tokenizer: CJK may consume >1 token/character.
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
     return sum(2 if ord(c) > 127 else 1 / 3 for c in text).__ceil__()
-
-
-@dataclass
-class Selection:
-    anchor: dict
-    events: list
-    protected: set
-    primary_media: set
-    reasons: dict
-    chosen_media: set = field(default_factory=set)
-    tokens: int = 0
 
 
 class ContextSelector:
     def __init__(self, journal, media, config):
         self.journal, self.media, self.config = journal, media, config
 
-    def candidates(self, anchor):
-        room, snapshot = anchor["room"], anchor["seq"]
-        recent = self.journal.recent(room, snapshot, anchor["received"] - float(self.config.get("context_minutes", 10)) * 60,
-                                     int(self.config.get("max_context_messages", 40)))
+    async def candidates(self, anchor):
+        room, trigger = anchor["room"], anchor["seq"]
+        recent, watermark = await self.journal.view(
+            anchor,
+            anchor["received"] - float(self.config.get("context_minutes", 10)) * 60,
+            int(self.config.get("max_context_messages", 40)),
+        )
         selected = {e["seq"]: e for e in recent}
-        selected[snapshot] = anchor
-        protected = {snapshot}
+        selected[trigger] = anchor
+        protected = {trigger}
         primary = set(image_ids(anchor["parts"]))
         reasons = {e["seq"]: "recent_room" for e in recent}
-        reasons[snapshot] = "anchor"
+        reasons[trigger] = "anchor"
         references = []
         parent = anchor
         for _ in range(3):
             reply = next((p for p in parent["parts"] if p["type"] == "reply"), None)
             if not reply:
                 break
-            parent = self.journal.get(room, reply["event_id"])
-            if not parent or parent["seq"] > snapshot or parent["seq"] <= self.journal.floor(room):
+            parent = await self.journal.get(room, reply["event_id"])
+            if not parent or parent["seq"] > trigger or parent["seq"] <= await self.journal.floor(room):
                 break
             selected[parent["seq"]] = parent
             protected.add(parent["seq"])
             reasons[parent["seq"]] = "explicit_reply"
             references.append(parent)
             primary.update(image_ids(parent["parts"]))
-        # Explicit cross-sender references outrank implicit same-sender images.
         if not references and not primary:
-            same = self.journal.same_sender(anchor, float(self.config.get("association_seconds", 120)), limit=8, images_only=True)
+            same = await self.journal.same_sender(
+                anchor, float(self.config.get("association_seconds", 120)), limit=8, images_only=True
+            )
             for event in same:
-                if event["seq"] == snapshot:
+                if event["seq"] == trigger:
                     continue
                 mids = image_ids(event["parts"])
                 if mids:
@@ -71,19 +64,17 @@ class ContextSelector:
                     protected.add(event["seq"])
                     reasons[event["seq"]] = "same_sender_recent_image"
                     primary.update(mids)
-                    if len(primary) > int(self.config.get("max_images", 6)):
-                        break
-        return Selection(anchor, sorted(selected.values(), key=lambda e: e["seq"]), protected, primary, reasons)
+        # Tool exchanges and their user trigger form one indivisible turn.
+        for event in list(selected.values()):
+            if event.get("causal_anchor") is not None:
+                parent = await self.journal.by_seq(room, event["causal_anchor"])
+                if parent:
+                    selected[parent["seq"]] = parent
+        return Selection(
+            anchor, sorted(selected.values(), key=event_order), protected, primary, reasons, watermark
+        )
 
-    def _image_cost(self, mid, room):
-        media = self.journal.media(mid, room)
-        if not media or media["status"] != "ready":
-            return 64
-        tiles = math.ceil(media["width"] / 512) * math.ceil(media["height"] / 512)
-        # A configurable conservative reserve, not a claim about provider pricing.
-        return max(int(self.config.get("image_token_reserve", 1600)), min(tiles, 64) * 256)
-
-    async def _parts(self, parts, room, selected_media, emitted):
+    async def _parts(self, parts, room, selected_media, records):
         output = []
         for part in parts:
             kind = part["type"]
@@ -92,95 +83,219 @@ class ContextSelector:
             elif kind == "image":
                 mid = part["media_id"]
                 output.append({"type": "text", "text": "[media_id=" + mid + "]"})
-                if mid in emitted:
-                    output.append({"type": "text", "text": "[与此前同一附件，原图已在上下文中]"})
-                elif mid in selected_media:
-                    uri = await self.media.data_uri(mid, room)
-                    if uri:
-                        output.append({"type": "image_url", "image_url": {"url": uri}})
-                        emitted.add(mid)
-                    else:
-                        state = self.journal.media(mid, room)
-                        output.append({"type": "text", "text": "[已收到图片，但附件状态=" + str(state["status"] if state else "missing") + "; 尚未看到图片内容]"})
+                record = records.get(mid)
+                if mid in selected_media and record and record["status"] == "ready":
+                    output.append({"type": "journal_image", "media_id": mid})
+                elif not record or record["status"] != "ready":
+                    output.append(
+                        {
+                            "type": "text",
+                            "text": "[已收到图片，但附件状态="
+                            + str(record["status"] if record else "missing")
+                            + "; 尚未看到图片内容]",
+                        }
+                    )
                 else:
-                    output.append({"type": "text", "text": "[背景图片未纳入本次视觉预算]"})
+                    output.append({"type": "text", "text": "[背景图片未纳入此历史帧的视觉预算]"})
             elif kind == "mention":
-                output.append({"type": "text", "text": "[mention_id=" + json.dumps(part["target_id"], ensure_ascii=False) + "]"})
+                output.append(
+                    {
+                        "type": "text",
+                        "text": "[mention_id=" + json.dumps(part["target_id"], ensure_ascii=False) + "]",
+                    }
+                )
             elif kind == "reply":
-                output.append({"type": "text", "text": "[reply_to=" + json.dumps(part["event_id"], ensure_ascii=False) + "]"})
+                output.append(
+                    {
+                        "type": "text",
+                        "text": "[reply_to=" + json.dumps(part["event_id"], ensure_ascii=False) + "]",
+                    }
+                )
             elif kind == "poke":
-                output.append({"type": "text", "text": "[戳一戳事件=" + json.dumps(
-                    {"actor_id": part["actor_id"], "target_id": part["target_id"]}, ensure_ascii=False) + "]"})
+                output.append(
+                    {
+                        "type": "text",
+                        "text": "[戳一戳事件="
+                        + json.dumps(
+                            {"actor_id": part["actor_id"], "target_id": part["target_id"]}, ensure_ascii=False
+                        )
+                        + "]",
+                    }
+                )
             elif kind == "forward":
-                output.append({"type": "text", "text": "[合并转发开始]" if part["available"] else "[合并转发内容无法获取]"})
+                output.append(
+                    {
+                        "type": "text",
+                        "text": "[合并转发开始]" if part["available"] else "[合并转发内容无法获取]",
+                    }
+                )
                 for node in part["nodes"]:
-                    output.append({"type": "text", "text": "[forward_sender=" + json.dumps({"id": node["sender_id"], "name": node["name"]}, ensure_ascii=False) + "]"})
-                    output.extend(await self._parts(node["parts"], room, selected_media, emitted))
+                    output.append(
+                        {
+                            "type": "text",
+                            "text": "[forward_sender="
+                            + json.dumps({"id": node["sender_id"], "name": node["name"]}, ensure_ascii=False)
+                            + "]",
+                        }
+                    )
+                    output.extend(await self._parts(node["parts"], room, selected_media, records))
                 if part["available"]:
                     output.append({"type": "text", "text": "[合并转发结束]"})
             elif kind == "unavailable":
-                output.append({"type": "text", "text": "[附件不可用: " + part["kind"] + "; " + part["reason"] + "]"})
+                output.append(
+                    {"type": "text", "text": "[附件不可用: " + part["kind"] + "; " + part["reason"] + "]"}
+                )
         return output
 
-    async def assemble(self, selection, fixed_tokens=0, total_limit=None, reserved_images=0):
+    async def _frame(self, event, chosen_media, records):
+        if event["kind"] == "self":
+            messages = [
+                copy.deepcopy(message)
+                for p in event["parts"]
+                if p["type"] == "protocol"
+                for message in p["messages"]
+            ]
+            return {"messages": messages}
+        metadata = {
+            "event_id": event["event_id"],
+            "sender_id": event["sender"],
+            "name": event["name"],
+            "time": datetime.fromtimestamp(event["received"], timezone.utc).isoformat(),
+            "source": event["kind"],
+        }
+        blocks = [
+            {"type": "text", "text": "[message_metadata=" + json.dumps(metadata, ensure_ascii=False) + "]"}
+        ]
+        blocks.extend(await self._parts(event["parts"], event["room"], chosen_media, records))
+        return {"messages": [{"role": "user", "content": blocks}]}
+
+    @staticmethod
+    def _frame_media(frame):
+        return {
+            p["media_id"]
+            for message in frame["messages"]
+            if isinstance(message.get("content"), list)
+            for p in message["content"]
+            if p.get("type") == "journal_image"
+        }
+
+    async def assemble(self, selection, fixed_tokens=0, total_limit=None, reserved_images=0, *, freeze=True):
         limit = min(int(self.config.get("input_token_budget", 32768)), total_limit or 10**9)
         budget = limit - fixed_tokens
         if budget <= 0:
             raise ContextLimit("人格和工具已占满输入预算，请提高预算或缩小工具集合。")
+        room = selection.anchor["room"]
+        records, frozen = await self.journal.context_data(
+            room,
+            [e["seq"] for e in selection.events],
+            {mid for event in selection.events for mid in image_ids(event["parts"])},
+        )
+
+        def key(mid):
+            record = records.get(mid)
+            return record["sha"] if record and record.get("sha") else mid
+
+        def keys(mids):
+            return {key(mid) for mid in mids}
+
         max_images = int(self.config.get("max_images", 6)) - reserved_images
-        if len(selection.primary_media) > max_images:
+        if len(keys(selection.primary_media)) > max_images:
             raise ContextLimit("关联图片超过本次上限，请引用具体图片或分批提问。")
-        selected_media = set(selection.primary_media)
-        ambient = int(self.config.get("background_images", 2))
-        for event in reversed(selection.events):
-            for mid in image_ids(event["parts"]):
-                if mid not in selected_media and ambient > 0 and len(selected_media) < max_images:
-                    selected_media.add(mid)
-                    ambient -= 1
-        def cost(event):
-            # Stored protocol messages contain no wire images or reasoning blobs.
-            return text_tokens(event["parts"]) + 120 + sum(
-                self._image_cost(mid, event["room"]) for mid in image_ids(event["parts"]) if mid in selected_media
+        image_costs = {}
+        for mid, record in records.items():
+            tiles = (
+                math.ceil(record["width"] / 512) * math.ceil(record["height"] / 512)
+                if record and record["status"] == "ready"
+                else 1
             )
-        mandatory = [e for e in selection.events if e["seq"] in selection.protected]
-        required = sum(cost(e) for e in mandatory)
-        if required > budget:
+            image_costs[key(mid)] = max(
+                int(self.config.get("image_token_reserve", 1600)), min(tiles, 64) * 256
+            )
+        preferred = set(selection.primary_media)
+        ambient = int(self.config.get("background_images", 2))
+        # Keep the oldest prefix stable, rather than rotating background images each turn.
+        for event in selection.events:
+            for mid in image_ids(event["parts"]):
+                if key(mid) not in keys(preferred) and ambient > 0 and len(keys(preferred)) < max_images:
+                    preferred.add(mid)
+                    ambient -= 1
+        frames = {}
+        for event in selection.events:
+            frames[event["seq"]] = frozen.get(event["seq"]) or await self._frame(event, preferred, records)
+
+        def frame_keys(seq):
+            return keys(self._frame_media(frames[seq]))
+
+        def text_cost(seq):
+            return text_tokens(frames[seq]) + 120
+
+        groups = {}
+        for event in selection.events:
+            parent = event.get("causal_anchor") or event["seq"]
+            groups.setdefault(parent, []).append(event["seq"])
+        mandatory = {seq for group in groups.values() if set(group) & selection.protected for seq in group}
+        chosen = set(mandatory)
+        used_images = keys(selection.primary_media) | set().union(*(frame_keys(seq) for seq in chosen))
+        used_text = sum(text_cost(seq) for seq in chosen)
+
+        def cost(text, images):
+            return text + sum(image_costs.get(k, 1600) for k in images)
+
+        if len(used_images) > max_images or cost(used_text, used_images) > budget:
             raise ContextLimit("当前问题和关联图片超出输入预算，请分批提问。")
-        chosen = {e["seq"]: e for e in mandatory}
-        used = required
-        for event in reversed(selection.events):
-            if event["seq"] not in chosen and used + cost(event) <= budget:
-                chosen[event["seq"]] = event
-                used += cost(event)
-        # Remove media reserved for background events that did not fit.
-        selected_media &= {mid for e in chosen.values() for mid in image_ids(e["parts"])}
-        selection.chosen_media, selection.tokens = selected_media, used + fixed_tokens
+        for group in reversed(list(groups.values())):
+            additional = set(group) - chosen
+            new_images = used_images | set().union(*(frame_keys(seq) for seq in additional))
+            new_text = used_text + sum(text_cost(seq) for seq in additional)
+            if len(new_images) <= max_images and cost(new_text, new_images) <= budget:
+                chosen.update(additional)
+                used_images, used_text = new_images, new_text
+        selected = [event for event in selection.events if event["seq"] in chosen]
+        selection.chosen_events = selected
+        selection.chosen_media = {mid for mid in records if key(mid) in used_images}
+        selection.tokens = cost(used_text, used_images) + fixed_tokens
+        selection.rebases = 0
         emitted = set()
-        messages = []
-        current = []
-        for event in sorted(chosen.values(), key=lambda e: e["seq"]):
-            if event["kind"] == "self":
-                for part in event["parts"]:
-                    if part["type"] == "protocol":
-                        # Keep whole tool exchanges as one selected journal event.
-                        for message in copy.deepcopy(part["messages"]):
-                            if isinstance(message.get("content"), list):
-                                blocks = []
-                                for block in message["content"]:
-                                    if block.get("type") == "journal_image":
-                                        blocks.extend(await self._parts([{"type": "image", "media_id": block["media_id"]}], event["room"], selected_media, emitted))
-                                    else:
-                                        blocks.append(block)
-                                message["content"] = blocks
-                            messages.append(message)
-                continue
-            metadata = {"event_id": event["event_id"], "sender_id": event["sender"], "name": event["name"],
-                        "time": datetime.fromtimestamp(event["received"], timezone.utc).isoformat(), "source": event["kind"]}
-            blocks = [{"type": "text", "text": "[message_metadata=" + json.dumps(metadata, ensure_ascii=False) + "]"}]
-            blocks.extend(await self._parts(event["parts"], event["room"], selected_media, emitted))
-            if event["seq"] == selection.anchor["seq"]:
-                current = blocks
-            else:
-                messages.append({"role": "user", "content": blocks})
-        selection.events = sorted(chosen.values(), key=lambda e: e["seq"])
-        return messages, current
+
+        async def materialize(blocks):
+            output = []
+            for block in blocks:
+                if block.get("type") != "journal_image":
+                    output.append(copy.deepcopy(block))
+                    continue
+                mid = block["media_id"]
+                asset = key(mid)
+                if asset in emitted:
+                    output.append({"type": "text", "text": "[与此前同一附件，原图已在上下文中]"})
+                    continue
+                uri = await self.media.data_uri(mid, room)
+                if uri:
+                    output.append({"type": "image_url", "image_url": {"url": uri}})
+                    emitted.add(asset)
+                else:
+                    selection.rebases += 1
+                    output.append({"type": "text", "text": "[原图附件已失效，尚未看到图片内容]"})
+            return output
+
+        if freeze:
+            new = {event["seq"]: frames[event["seq"]] for event in selected if not frozen.get(event["seq"])}
+            if new:
+                frames.update(await self.journal.freeze_many(new))
+        history, current = [], []
+        for event in selected:
+            frame = frames[event["seq"]]
+            for message in frame["messages"]:
+                wire = copy.deepcopy(message)
+                if isinstance(wire.get("content"), list):
+                    wire["content"] = await materialize(wire["content"])
+                if event["seq"] == selection.anchor["seq"]:
+                    current = wire["content"]
+                else:
+                    history.append(wire)
+        # An old frame may have omitted an image or captured its pending state.
+        # Add the now-required original at the tail, without rewriting that frame.
+        for mid in sorted(selection.primary_media):
+            if key(mid) not in emitted and records.get(mid) and records[mid]["status"] == "ready":
+                current.append({"type": "text", "text": "[本轮关联原图 media_id=" + mid + "]"})
+                current.extend(await materialize([{"type": "journal_image", "media_id": mid}]))
+        return history, current

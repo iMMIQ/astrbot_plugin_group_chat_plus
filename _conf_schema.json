@@ -102,7 +102,11 @@
   "poke_message_mode": {
     "description": "QQ 群戳一戳：bot_only 仅接收戳机器人（明确唤醒）；all 同时记录成员互戳；ignore 忽略",
     "type": "string",
-    "options": ["bot_only", "all", "ignore"],
+    "options": [
+      "bot_only",
+      "all",
+      "ignore"
+    ],
     "default": "bot_only"
   },
   "poke_enabled_groups": {
@@ -129,5 +133,25 @@
     "description": "回复后戳一戳的延迟（秒）",
     "type": "float",
     "default": 0.5
+  },
+  "config_version": {
+    "description": "配置结构版本；升级时保留已有行为设置",
+    "type": "int",
+    "default": 2
+  },
+  "max_pending_turns": {
+    "description": "每群同时执行及等待的回复上限",
+    "type": "int",
+    "default": 8
+  },
+  "queue_wait_seconds": {
+    "description": "回复排队超时（秒）",
+    "type": "int",
+    "default": 120
+  },
+  "max_pending_media": {
+    "description": "实例附件下载队列上限",
+    "type": "int",
+    "default": 128
   }
 }

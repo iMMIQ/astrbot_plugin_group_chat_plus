@@ -1,4 +1,5 @@
 """AstrBot v4.28 request boundary, with no new handler wrapping."""
+
 from __future__ import annotations
 
 import copy
@@ -6,7 +7,6 @@ import json
 from collections import Counter
 
 from .context import text_tokens
-
 
 GROUP_RULES = """
 你正在群聊中回复。message_metadata 是平台提供的消息身份和时间；区分发送者和引用关系。
@@ -36,15 +36,21 @@ def additions(current, baseline):
 
 def request_snapshot(req):
     history = json.loads(req.conversation.history) if req.conversation else []
-    return {"contexts": copy.deepcopy(req.contexts),
-            "framework_extensions": additions(req.contexts, history),
-            "extra_images": [p if isinstance(p, dict) else p.model_dump() for p in req.extra_user_content_parts
-                             if (p.get("type") if isinstance(p, dict) else p.type) == "image_url"],
-            "image_urls": list(req.image_urls or [])}
+    return {
+        "contexts": copy.deepcopy(req.contexts),
+        "framework_extensions": additions(req.contexts, history),
+        "extra_images": [
+            p if isinstance(p, dict) else p.model_dump()
+            for p in req.extra_user_content_parts
+            if (p.get("type") if isinstance(p, dict) else p.type) == "image_url"
+        ],
+        "image_urls": list(req.image_urls or []),
+    }
 
 
 def payload_cost(value, image_reserve):
     images = 0
+
     def trim(item):
         nonlocal images
         if isinstance(item, dict):
@@ -55,6 +61,7 @@ def payload_cost(value, image_reserve):
         if isinstance(item, list):
             return [trim(v) for v in item]
         return item
+
     cost = text_tokens(trim(value))
     return cost + images * image_reserve, images
 
@@ -86,15 +93,21 @@ async def rewrite(req, selection, selector, snapshot, retrieval_text, max_contex
     for url in additions(req.image_urls or [], snapshot["image_urls"]):
         retained.append({"type": "image_url", "image_url": {"url": url}})
     extra_dump = retained
-    external_cost, external_images = payload_cost([extensions, extra_dump], int(selector.config.get("image_token_reserve", 1600)))
+    external_cost, external_images = payload_cost(
+        [extensions, extra_dump], int(selector.config.get("image_token_reserve", 1600))
+    )
     fixed = text_tokens(system) + text_tokens(tools) + external_cost + text_tokens(prompt_additions)
     max_input = max_context - 4096 if max_context > 4096 else None
-    history, current = await selector.assemble(selection, fixed_tokens=fixed, total_limit=max_input, reserved_images=external_images)
-    req.contexts = extensions + history
+    history, current = await selector.assemble(
+        selection, fixed_tokens=fixed, total_limit=max_input, reserved_images=external_images
+    )
+    req.contexts = history + extensions
     req.system_prompt = system
     req.prompt = ""
     req.image_urls = []
-    req.extra_user_content_parts = current + extra_dump + [{"type": "text", "text": text} for text in prompt_additions]
+    req.extra_user_content_parts = (
+        current + extra_dump + [{"type": "text", "text": text} for text in prompt_additions]
+    )
     return history, current
 
 
@@ -102,8 +115,11 @@ def protocol_messages(messages):
     result = []
     for message in messages:
         item = message.model_dump() if hasattr(message, "model_dump") else copy.deepcopy(message)
-        tool_image_message = item.get("role") == "user" and isinstance(item.get("content"), list) and any(
-            p.get("type") == "image_url" for p in item["content"])
+        tool_image_message = (
+            item.get("role") == "user"
+            and isinstance(item.get("content"), list)
+            and any(p.get("type") == "image_url" for p in item["content"])
+        )
         if item.get("role") not in {"assistant", "tool"} and not tool_image_message:
             continue
         if isinstance(item.get("content"), list):
@@ -118,10 +134,12 @@ def restore_legacy_wrappers(registry):
     for handler in registry:
         function = handler.handler
         defaults = getattr(function, "__kwdefaults__", {}) or {}
-        if (getattr(handler, "_gcp_tracking_wrapped", False)
-                and getattr(function, "__name__", "") == "_make_tracking_wrapper"
-                and "astrbot_plugin_group_chat_plus" in getattr(function, "__module__", "")
-                and callable(defaults.get("__original"))):
+        if (
+            getattr(handler, "_gcp_tracking_wrapped", False)
+            and getattr(function, "__name__", "") == "_make_tracking_wrapper"
+            and "astrbot_plugin_group_chat_plus" in getattr(function, "__module__", "")
+            and callable(defaults.get("__original"))
+        ):
             handler.handler = defaults["__original"]
             handler._gcp_tracking_wrapped = False
             count += 1
