@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import copy
 import json
 import logging
 import random
@@ -18,10 +17,11 @@ from .adapters.poke import in_scope as poke_scope
 from .adapters.poke import notice as poke_notice
 from .adapters.poke import probability
 from .adapters.poke import send as send_poke
-from .bridge import additions, protocol_messages, request_snapshot, rewrite
+from .bridge import GATE_RULES, additions, protocol_messages, request_snapshot, rewrite
 from .context import ContextLimit, ContextSelector
 from .models import TurnState
 from .participation import Participation
+from .segments import SegmentManager, digest
 from .storage.assets import MediaStore
 from .storage.sqlite import Journal
 
@@ -54,6 +54,7 @@ class ConversationService:
         self.media = MediaStore(self.journal, self.root / "media", config)
         self.adapter = PlatformAdapter(self.journal, self.media)
         self.selector = ContextSelector(self.journal, self.media, config)
+        self.segments = SegmentManager(self.selector)
         self.participation = Participation(config)
         self.rooms = {}
         self.running_tasks = set()
@@ -66,7 +67,7 @@ class ConversationService:
         restored = self.gateway.restore_wrappers()
         self.cleanup_task = asyncio.create_task(self._cleanup())
         self.logger.info(
-            "[NativeMM] v2.1.0 已加载；旧包装恢复=%s，主动参与=%s",
+            "[NativeMM] v2.2.0 已加载；旧包装恢复=%s，主动参与=%s",
             restored,
             self.config["auto_reply_enabled"],
         )
@@ -220,10 +221,25 @@ class ConversationService:
                     if not self.participation.claim(anchor["room"]):
                         return
                     history, current = await self.selector.assemble(
-                        selection, fixed_tokens=1000, freeze=False
+                        selection,
+                        fixed_tokens=1000,
+                        total_limit=self.config["gate_token_budget"],
+                        freeze=False,
                     )
                     if image_count(history, current):
                         self.gateway.validate_images(event, provider)
+                    await self.journal.diagnose(
+                        anchor["room"],
+                        digest({"provider": provider.provider_config.get("id")}),
+                        "gate",
+                        {
+                            "system": digest(GATE_RULES),
+                            "tools": digest([]),
+                            "messages": [digest(m) for m in history + [{"role": "user", "content": current}]],
+                            "stable": [],
+                            "segment": "gate",
+                        },
+                    )
                     started = time.monotonic()
                     gate = None
                     try:
@@ -240,11 +256,17 @@ class ConversationService:
                         )
                     if not self.participation.accepts(gate.completion_text):
                         return
-                gid = await self.journal.begin(anchor["room"], anchor["seq"])
+                gid = await self.journal.begin(anchor["room"], anchor["seq"], event.unified_msg_origin)
                 if gid is None:
                     return
-                state = TurnState(selection, gid, provider, auto=auto, started=time.monotonic())
-                state.transport = self.gateway.track_transport(event, self.journal, gid)
+                state = TurnState(
+                    selection, gid, provider, auto=auto, started=time.monotonic(), media_leases=leased
+                )
+
+                async def public_sent(chain, receipt, platform_id):
+                    await self.public_sent(event, state, chain, receipt, platform_id)
+
+                state.transport = self.gateway.track_transport(event, self.journal, gid, public_sent)
                 event.set_extra(OWNER, state)
                 text = "\n".join(p["text"] for p in anchor["parts"] if p["type"] == "text").strip()
                 if not text:
@@ -338,6 +360,35 @@ class ConversationService:
             return
         try:
             maximum = int(state.provider.provider_config.get("max_context_tokens", 0) or 0)
+
+            async def summarize(rules, data):
+                response, start = None, time.monotonic()
+                try:
+                    response = await self.gateway.summarize(event, state.provider, rules, data)
+                    await self.journal.diagnose(
+                        state.selection.anchor["room"],
+                        digest(event.unified_msg_origin),
+                        "summary",
+                        {
+                            "system": digest(rules),
+                            "tools": digest([]),
+                            "messages": [digest(data)],
+                            "stable": [],
+                            "segment": state.selection.segment_id,
+                        },
+                    )
+                    return response.completion_text
+                finally:
+                    await self.record_usage(
+                        state.selection,
+                        "summary",
+                        state.provider,
+                        getattr(response, "usage", None),
+                        time.monotonic() - start,
+                        0,
+                        "completed" if response else "error",
+                    )
+
             _, current = await rewrite(
                 req,
                 state.selection,
@@ -345,7 +396,23 @@ class ConversationService:
                 state.snapshot,
                 event.get_extra(OWNER + "_retrieval"),
                 maximum,
+                segments=self.segments,
+                scope_policy=self.gateway.scope_policy(event, state.provider),
+                summarize=summarize,
             )
+            await self.journal.link(
+                state.selection.anchor["room"],
+                state.selection.anchor["seq"],
+                [
+                    e["seq"]
+                    for e in state.selection.chosen_events
+                    if e["seq"] in state.selection.protected
+                    or bool(set(image_ids(e["parts"])) & state.selection.chosen_media)
+                ],
+            )
+            extra_leases = state.selection.chosen_media - set(state.media_leases)
+            self.media.lease(extra_leases)
+            state.media_leases.extend(extra_leases)
             count = image_count(req.contexts, req.extra_user_content_parts)
             if count:
                 self.gateway.validate_images(event, state.provider)
@@ -376,6 +443,7 @@ class ConversationService:
 
     async def agent_begin(self, event, run_context):
         if state := event.get_extra(OWNER):
+            state.run_context = run_context
             state.baseline_protocol = protocol_messages(run_context.messages)
 
     async def agent_done(self, event, run_context, response):
@@ -384,7 +452,6 @@ class ConversationService:
             return
         event.set_extra(OWNER + "_done", True)
         tail = additions(protocol_messages(run_context.messages), state.baseline_protocol)
-        mirror_tail = copy.deepcopy(tail)
         for message in tail:
             if isinstance(message.get("content"), list):
                 for index, part in enumerate(message["content"]):
@@ -393,14 +460,6 @@ class ConversationService:
                             state.selection.anchor["room"], part["image_url"]["url"]
                         )
                         message["content"][index] = {"type": "journal_image", "media_id": mid}
-        for message in mirror_tail:
-            if isinstance(message.get("content"), list):
-                message["content"] = [
-                    {"type": "text", "text": "[工具图片保存在插件附件日志]"}
-                    if p.get("type") == "image_url"
-                    else p
-                    for p in message["content"]
-                ]
         success = response is not None and response.role in {"assistant", "tool"}
         await self.journal.finish(
             state.gid, "generated" if success else "failed", tail, str(event.get_self_id())
@@ -408,8 +467,24 @@ class ConversationService:
         self.gateway.mirror(
             run_context,
             [{"role": "user", "content": state.current or [{"type": "text", "text": "[群聊消息]"}]}]
-            + mirror_tail,
+            + state.public_messages,
         )
+
+    async def public_sent(self, event, state, chain, receipt, platform_id):
+        parts = await self.adapter.normalize(event, list(chain.chain), state.selection.anchor["room"])
+        public = await self.journal.publish(state.gid, receipt, parts, str(event.get_self_id()), platform_id)
+        if public:
+            # The core mirror must also contain only observed public deliveries.
+            texts = [p["text"] for p in public["parts"] if p["type"] == "text"]
+            state.public_messages.append(
+                {"role": "assistant", "content": "\n".join(texts) or "[机器人已发送附件]"}
+            )
+            if state.run_context and event.get_extra(OWNER + "_done", False):
+                self.gateway.mirror(
+                    state.run_context,
+                    [{"role": "user", "content": state.current or [{"type": "text", "text": "[群聊消息]"}]}]
+                    + state.public_messages,
+                )
 
     async def delivered(self, event):
         state = event.get_extra(OWNER)
@@ -453,7 +528,7 @@ class ConversationService:
     async def status(self, event):
         if self.enabled(event):
             yield event.plain_result(
-                "NativeMM v2.1.0\n"
+                "NativeMM v2.2.0\n"
                 + json.dumps(await self.journal.status(room_key(event)), ensure_ascii=False)
             )
             event.stop_event()

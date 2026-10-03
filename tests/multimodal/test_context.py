@@ -215,7 +215,7 @@ def test_media_reboot_and_cleanup_lease(tmp_path):
     asyncio.run(scenario())
 
 
-def test_protocol_turn_keeps_tool_ids(env):
+def test_protocol_is_private_and_keeps_tool_ids(env):
 
     async def scenario():
         (j, m, s) = env
@@ -235,8 +235,11 @@ def test_protocol_turn_keeps_tool_ids(env):
         await j.finish(gid, "generated", protocol, "bot")
         current = await add(j, "next", received=time.time())
         (history, parts) = await s.assemble(await s.candidates(current))
-        assert [msg["role"] for msg in history] == ["user", "assistant", "tool", "assistant"]
-        assert history[2]["tool_call_id"] == "t1"
+        assert [msg["role"] for msg in history] == ["user"]
+        execution = await j.execution(gid)
+        assert execution == protocol
+        assert execution[1]["tool_call_id"] == "t1"
+        assert await j.execution(gid, "another-session") is None
 
     asyncio.run(scenario())
 

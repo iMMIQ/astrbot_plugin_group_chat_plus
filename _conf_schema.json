@@ -153,5 +153,20 @@
     "description": "实例附件下载队列上限",
     "type": "int",
     "default": 128
+  },
+  "segment_idle_minutes": {
+    "description": "上下文段空闲多久后重新从近期消息开始（分钟）",
+    "type": "int",
+    "default": 30
+  },
+  "summary_token_budget": {
+    "description": "换段时较早群聊摘要的最大估算 token 数",
+    "type": "int",
+    "default": 1024
+  },
+  "gate_token_budget": {
+    "description": "主动参与判断的输入预算；正式回复仍使用完整上下文预算",
+    "type": "int",
+    "default": 4096
   }
 }

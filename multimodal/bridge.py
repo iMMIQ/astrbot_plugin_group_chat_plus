@@ -7,6 +7,7 @@ import json
 from collections import Counter
 
 from .context import text_tokens
+from .segments import digest
 
 GROUP_RULES = """
 你正在群聊中回复。message_metadata 是平台提供的消息身份和时间；区分发送者和引用关系。
@@ -16,6 +17,9 @@ GROUP_RULES = """
 直接回复当前触发者的问题，自然遵循既有人格，不输出是否参与群聊的判断过程。
 戳一戳事件是平台动作；区分谁戳了谁。有人戳你时可自然回应，历史中已执行的戳人动作不要重复声称尚未执行。
 """.strip()
+
+
+GATE_RULES = GROUP_RULES + '\n判断是否值得主动参与，严格只返回 JSON {"reply":true或false}。不使用工具。'
 
 
 def fingerprint(value):
@@ -66,7 +70,18 @@ def payload_cost(value, image_reserve):
     return cost + images * image_reserve, images
 
 
-async def rewrite(req, selection, selector, snapshot, retrieval_text, max_context=0):
+async def rewrite(
+    req,
+    selection,
+    selector,
+    snapshot,
+    retrieval_text,
+    max_context=0,
+    *,
+    segments=None,
+    scope_policy=None,
+    summarize=None,
+):
     extensions = snapshot["framework_extensions"] + additions(req.contexts, snapshot["contexts"])
     extra = list(req.extra_user_content_parts or [])
     # Only remove the exact retrieval anchor; do not regex-reconstruct persona.
@@ -98,9 +113,16 @@ async def rewrite(req, selection, selector, snapshot, retrieval_text, max_contex
     )
     fixed = text_tokens(system) + text_tokens(tools) + external_cost + text_tokens(prompt_additions)
     max_input = max_context - 4096 if max_context > 4096 else None
-    history, current = await selector.assemble(
-        selection, fixed_tokens=fixed, total_limit=max_input, reserved_images=external_images
-    )
+    scope = digest({"system": system, "tools": tools, "policy": scope_policy})
+    if segments:
+        history, current, canonical = await segments.assemble(
+            selection, scope, fixed, max_input, external_images, summarize
+        )
+    else:
+        history, current = await selector.assemble(
+            selection, fixed_tokens=fixed, total_limit=max_input, reserved_images=external_images
+        )
+        canonical = current
     req.contexts = history + extensions
     req.system_prompt = system
     req.prompt = ""
@@ -108,7 +130,20 @@ async def rewrite(req, selection, selector, snapshot, retrieval_text, max_contex
     req.extra_user_content_parts = (
         current + extra_dump + [{"type": "text", "text": text} for text in prompt_additions]
     )
-    return history, current
+    if segments:
+        hashes = {
+            "system": digest(system),
+            "tools": digest(tools),
+            "history": digest(req.contexts),
+            "messages": [
+                digest(m) for m in req.contexts + [{"role": "user", "content": req.extra_user_content_parts}]
+            ],
+            "stable": [digest(m) for m in history],
+            "segment": selection.segment_id,
+            "rollover": selection.rollover,
+        }
+        await selector.journal.diagnose(selection.anchor["room"], digest(scope_policy), "reply", hashes)
+    return history, canonical
 
 
 def protocol_messages(messages):

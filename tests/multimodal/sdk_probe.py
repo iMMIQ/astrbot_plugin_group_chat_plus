@@ -87,6 +87,20 @@ async def main():
                 completion_text='{"reply":true}',
                 usage=TokenUsage(input_other=32, input_cached=64, output=4),
             )
+        if "将群聊数据压缩为 JSON" in kwargs.get("system_prompt", ""):
+            data = json.loads(kwargs["prompt"])
+            first = data["messages"][0]
+            return LLMResponse(
+                role="assistant",
+                completion_text=json.dumps(
+                    {
+                        "items": [
+                            {"text": first["sender"] + ": 讨论旅行计划，路线待定", "sources": [first["seq"]]}
+                        ]
+                    }
+                ),
+                usage=TokenUsage(input_other=48, input_cached=16, output=24),
+            )
         if tool_mode["enabled"] and tool_mode["step"] == 0:
             tool_mode["step"] += 1
             return LLMResponse(
@@ -218,11 +232,11 @@ async def main():
             pending = asyncio.create_task(anext(second))
             await asyncio.sleep(0.02)
             assert not pending.done()
+            await one.send(one.plain_result("first-visible-answer"))
             await first.aclose()
             await asyncio.wait_for(pending, 20)
-            prior_gid = one.get_extra(module.OWNER).gid
             assert any(
-                e["event_id"] == "generation:" + prior_gid
+                e.get("causal_anchor") == one.get_extra(module.OWNER).selection.anchor["seq"]
                 for e in two.get_extra(module.OWNER).selection.events
             )
             await second.aclose()
@@ -278,11 +292,9 @@ async def main():
             ):
                 async for _ in plugin.respond(query):
                     pass
-            protocol = (
-                await plugin.service.journal.get(
-                    initial["room"], "generation:" + query.get_extra(module.OWNER).gid
-                )
-            )["parts"][0]["messages"]
+            protocol = await plugin.service.journal.execution(
+                query.get_extra(module.OWNER).gid, query.unified_msg_origin
+            )
             assert [p["role"] for p in protocol] == ["assistant", "tool", "user", "assistant"]
             assert protocol[0]["tool_calls"][0]["id"] == protocol[1]["tool_call_id"] == "call-fixture"
             assert "fixture_tool_result" in json.dumps(protocol)
@@ -303,11 +315,9 @@ async def main():
             ):
                 async for _ in plugin.respond(query):
                     pass
-            protocol = (
-                await plugin.service.journal.get(
-                    initial["room"], "generation:" + query.get_extra(module.OWNER).gid
-                )
-            )["parts"][0]["messages"]
+            protocol = await plugin.service.journal.execution(
+                query.get_extra(module.OWNER).gid, query.unified_msg_origin
+            )
             assert [p["role"] for p in protocol] == ["assistant", "tool"]
             assert protocol[0]["tool_calls"][0]["id"] == protocol[1]["tool_call_id"]
             results["terminal_tool_result_persisted_without_fake_reply"] = True
@@ -381,8 +391,12 @@ async def main():
                 )
                 delivery.send = AsyncMock(side_effect=failures)
                 state = TurnState(selection, gid, provider)
+
+                async def ack(chain, receipt, platform_id):
+                    await plugin.service.public_sent(delivery, state, chain, receipt, platform_id)
+
                 state.transport = plugin.service.gateway.track_transport(
-                    delivery, plugin.service.journal, gid
+                    delivery, plugin.service.journal, gid, ack
                 )
                 delivery.set_extra(module.OWNER, state)
                 result = delivery.plain_result("part1").set_result_content_type(ResultContentType.LLM_RESULT)
@@ -403,9 +417,106 @@ async def main():
                     assert status["delivery"] == expected
                     assert state.transport.attempts == 2
                     assert status["sent_parts"] == (1 if expected == "partial" else 0)
+                    view, _ = await plugin.service.journal.view(anchor, 0, 100)
+                    public = [e for e in view if e["kind"] == "self"]
+                    # Current generation follows its anchor; inspect full room snapshot.
+                    public = [
+                        e
+                        for e in await plugin.service.journal.recent(anchor["room"], 2**63 - 1, 0, 100)
+                        if e["kind"] == "self"
+                    ]
+                    assert len(public) == (1 if expected == "partial" else 0)
+                    if public:
+                        assert public[0]["parts"] == [{"type": "text", "text": "part1"}]
                 finally:
                     state.transport.restore()
             results["real_segmented_send_failures_are_not_success"] = True
+
+            # Real aiocqhttp send() returns None, but its underlying API ACK
+            # carries the ID needed by a later quote. Delegate only this event.
+            from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+
+            source = event("real-onebot-source", [Image.fromBytes(PNG)], sender="12345", group="34567")
+            source.message_obj.self_id = "67890"
+            await record(plugin, source)
+            original = event("real-onebot-question", [Plain("看这张图")], sender="12345", group="34567")
+            original.message_obj.self_id = "67890"
+            source.message_obj.self_id = "67890"
+            bot = SimpleNamespace(send_group_msg=AsyncMock(return_value={"message_id": 998877}))
+            real = AiocqhttpMessageEvent(
+                original.message_str, original.message_obj, original.platform_meta, original.session_id, bot
+            )
+            await record(plugin, real)
+            anchor = real.get_extra(module.OWNER + "_anchor")
+            photo = source.get_extra(module.OWNER + "_anchor")
+            await plugin.service.journal.link(anchor["room"], anchor["seq"], [photo["seq"]])
+            gid = await plugin.service.journal.begin(anchor["room"], anchor["seq"], real.unified_msg_origin)
+            state = TurnState(await plugin.service.selector.candidates(anchor), gid, provider)
+
+            async def actual_ack(chain, receipt, platform_id):
+                await plugin.service.public_sent(real, state, chain, receipt, platform_id)
+
+            tracker = plugin.service.gateway.track_transport(real, plugin.service.journal, gid, actual_ack)
+            try:
+                assert real.bot is not bot
+                assert await real.send(real.plain_result("actual-platform-reply")) is None
+                stored = await plugin.service.journal.get(anchor["room"], "998877")
+                assert stored["parts"] == [{"type": "text", "text": "actual-platform-reply"}]
+                assert stored["causal_anchor"] == anchor["seq"]
+                assert bot.send_group_msg.await_count == 1
+                assert tracker.successes == 1
+            finally:
+                tracker.restore()
+            assert real.bot is bot
+            late = (
+                await plugin.service.journal.add(
+                    anchor["room"],
+                    "late-real-quote",
+                    "23456",
+                    "B",
+                    [{"type": "reply", "event_id": "998877"}, {"type": "text", "text": "这张图呢"}],
+                    received=anchor["received"] + 901,
+                )
+            )[0]
+            history, current = await plugin.service.selector.assemble(
+                await plugin.service.selector.candidates(late)
+            )
+            assert json.dumps([history, current]).count("data:image/png;base64,") == 1
+            results["real_onebot_discarded_ack_id_preserved_without_shared_mutation"] = True
+
+            # Compression goes through a real provider contract and core stats,
+            # only at segment rollover; it is not an extra per-message rewrite.
+            tool_mode["enabled"] = False
+            plugin.config.update(input_token_budget=5000, summary_token_budget=400)
+            summary_before = sum("将群聊数据压缩为 JSON" in c.get("system_prompt", "") for c in captures)
+            for index in range(8):
+                query = event(
+                    "summary-" + str(index),
+                    [At(qq="fixture-bot"), Plain("旅行计划" * 60)],
+                    group="summary-room",
+                )
+                await record(plugin, query)
+                with patch(
+                    "astrbot.core.astr_main_agent.retrieve_knowledge_base", new=AsyncMock(return_value=None)
+                ):
+                    flow = plugin.respond(query)
+                    async for _ in flow:
+                        await query.send(query.plain_result("visible-summary-room-reply"))
+            summary_after = sum("将群聊数据压缩为 JSON" in c.get("system_prompt", "") for c in captures)
+            assert 0 < summary_after - summary_before < 8
+            report = await plugin.service.journal.status(
+                query.get_extra(module.OWNER).selection.anchor["room"]
+            )
+            phase = next(p for p in report["trace"] if p["phase"] == "summary")
+            assert phase["calls"] == summary_after - summary_before
+            assert phase["cached_tokens"] == phase["calls"] * 16
+            assert report["diagnostics"] and report["segments"] == 1
+            assert any(
+                row["provider_id"] == "fixture-provider" and row["stats"]["token_usage"]["input_cached"] == 16
+                for row in [call.kwargs for call in stat_sink.await_args_list]
+            )
+            plugin.config.update(input_token_budget=32768, summary_token_budget=1024)
+            results["real_summary_only_on_rollover_and_core_cache_stats_preserved"] = True
 
             # Real notice shape: no text and no @; bypass the ordinary auto gate.
             tool_mode["enabled"] = False

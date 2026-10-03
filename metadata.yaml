@@ -2,7 +2,7 @@ name: astrbot_plugin_group_chat_plus
 display_name: NativeMM 群聊
 desc: 原图直传、持久群聊时间线、带身份与引用关系的多模态上下文
 help: 明确 @ 和引用 bot 回复；/mmstatus 查看状态；管理员 /mmreset 重置本群上下文。首次切换后只读取新接收的消息。
-version: v2.1.0
+version: v2.2.0
 author: iMMIQ; upstream Him666233
 repo: https://github.com/iMMIQ/astrbot_plugin_group_chat_plus
 astrbot_version: ">=4.28.2,<4.28.3"

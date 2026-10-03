@@ -23,10 +23,15 @@ class SQLiteRepository:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version > 2:
+        if version > 3:
             raise RuntimeError("Unsupported journal schema; use the matching plugin version")
         if version == 1:
             backup = root / "events.pre-v2.sqlite3"
+            if not backup.exists():
+                with sqlite3.connect(backup) as target:
+                    self.db.backup(target)
+        if version in (1, 2):
+            backup = root / "events.pre-v3.sqlite3"
             if not backup.exists():
                 with sqlite3.connect(backup) as target:
                     self.db.backup(target)
@@ -116,7 +121,72 @@ class SQLiteRepository:
             self.db.execute(
                 "UPDATE media SET source='inline:'||COALESCE(sha,id) WHERE source LIKE 'data:%' OR source LIKE 'base64://%'"
             )
-            self.db.execute("PRAGMA user_version=2")
+            if version < 3:
+                self.db.execute("ALTER TABLE generations ADD COLUMN scope TEXT NOT NULL DEFAULT ''")
+            for statement in """
+                CREATE TABLE IF NOT EXISTS executions (
+                    generation TEXT PRIMARY KEY REFERENCES generations(id) ON DELETE CASCADE,
+                    scope TEXT NOT NULL, payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS turn_links (
+                    room TEXT NOT NULL, anchor INTEGER NOT NULL REFERENCES events(seq) ON DELETE CASCADE,
+                    source INTEGER NOT NULL REFERENCES events(seq) ON DELETE CASCADE,
+                    PRIMARY KEY(room,anchor,source)
+                );
+                CREATE TABLE IF NOT EXISTS segments (
+                    room TEXT NOT NULL, scope TEXT NOT NULL, payload TEXT NOT NULL,
+                    updated REAL NOT NULL, PRIMARY KEY(room,scope)
+                );
+                CREATE TABLE IF NOT EXISTS diagnostics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, room TEXT NOT NULL,
+                    scope TEXT NOT NULL, phase TEXT NOT NULL, payload TEXT NOT NULL,
+                    created REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS diagnostic_scope ON diagnostics(room,scope,phase,id);
+            """.split(";"):
+                if statement.strip():
+                    self.db.execute(statement)
+            if version < 3:
+                # Earlier versions published generated protocol before transport ACK.
+                # Keep it privately; only complete legacy sends have a recoverable reply.
+                for row in self.db.execute(
+                    "SELECT e.*,g.id AS gid,g.delivery FROM events e JOIN generations g ON e.event_id='generation:'||g.id AND e.room=g.room WHERE e.kind='self'"
+                ).fetchall():
+                    parts = json.loads(row["parts"])
+                    protocol = [m for p in parts if p["type"] == "protocol" for m in p["messages"]]
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO executions VALUES(?,?,?)",
+                        (row["gid"], "legacy", json.dumps(protocol, ensure_ascii=False)),
+                    )
+                    public = []
+                    if row["delivery"] == "sent":
+                        # Only the final assistant text is knowable, never tool results.
+                        final = next(
+                            (
+                                m
+                                for m in reversed(protocol)
+                                if m.get("role") == "assistant" and not m.get("tool_calls")
+                            ),
+                            {},
+                        )
+                        content = final.get("content", "")
+                        public = (
+                            [{"type": "text", "text": content}]
+                            if isinstance(content, str) and content
+                            else [p for p in content if p.get("type") == "text"]
+                            if isinstance(content, list)
+                            else []
+                        )
+                    self.db.execute(
+                        "UPDATE events SET kind=?,parts=? WHERE seq=?",
+                        (
+                            "self" if public else "execution",
+                            json.dumps(public, ensure_ascii=False),
+                            row["seq"],
+                        ),
+                    )
+                    self.db.execute("DELETE FROM frames WHERE event_seq=?", (row["seq"],))
+            self.db.execute("PRAGMA user_version=3")
 
             self.db.commit()
             if version == 1:
@@ -193,11 +263,13 @@ class SQLiteRepository:
         seq = self.db.execute("SELECT COALESCE(MAX(seq),0) FROM events WHERE room=?", (room,)).fetchone()[0]
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO room_state VALUES(?,?)", (room, seq))
+            self.db.execute("DELETE FROM segments WHERE room=?", (room,))
+            self.db.execute("DELETE FROM turn_links WHERE room=?", (room,))
         return seq
 
     def recent(self, room, snapshot, since, limit):
         rows = self.db.execute(
-            "SELECT * FROM events WHERE room=? AND seq>? AND seq<=? AND received>=? ORDER BY seq DESC LIMIT ?",
+            "SELECT * FROM events WHERE room=? AND kind!='execution' AND seq>? AND seq<=? AND received>=? ORDER BY seq DESC LIMIT ?",
             (room, self.floor(room), snapshot, since, limit),
         ).fetchall()
         return [self._event(r) for r in reversed(rows)]
@@ -265,7 +337,7 @@ class SQLiteRepository:
             "SELECT COALESCE(MAX(seq),0) FROM events WHERE room=?", (room,)
         ).fetchone()[0]
         rows = self.db.execute(
-            """SELECT * FROM events WHERE room=? AND seq>? AND seq<=? AND received>=?
+            """SELECT * FROM events WHERE room=? AND kind!='execution' AND seq>? AND seq<=? AND received>=?
             AND (seq<=? OR (kind='self' AND causal_anchor<?))
             ORDER BY COALESCE(causal_anchor,seq) DESC, (causal_anchor IS NOT NULL) DESC,seq DESC LIMIT ?""",
             (room, self.floor(room), watermark, since, anchor["seq"], anchor["seq"], limit),
@@ -326,7 +398,8 @@ class SQLiteRepository:
     def by_seq(self, room, seq):
         return self._event(
             self.db.execute(
-                "SELECT * FROM events WHERE room=? AND seq=? AND seq>?", (room, seq, self.floor(room))
+                "SELECT * FROM events WHERE room=? AND kind!='execution' AND seq=? AND seq>?",
+                (room, seq, self.floor(room)),
             ).fetchone()
         )
 
@@ -342,12 +415,12 @@ class SQLiteRepository:
                 self.db.execute("INSERT OR IGNORE INTO frames VALUES(?,1,?)", (seq, wire))
         return {seq: self.frame(seq) for seq in frames}
 
-    def begin(self, room, anchor):
+    def begin(self, room, anchor, scope=""):
         gid = uuid.uuid4().hex
         with self.db:
             cur = self.db.execute(
-                "INSERT OR IGNORE INTO generations(id,room,anchor,status,created) VALUES(?,?,?,'running',?)",
-                (gid, room, anchor, time.time()),
+                "INSERT OR IGNORE INTO generations(id,room,anchor,status,created,scope) VALUES(?,?,?,'running',?,?)",
+                (gid, room, anchor, time.time(), scope),
             )
         return gid if cur.rowcount else None
 
@@ -358,20 +431,83 @@ class SQLiteRepository:
             return
         with self.db:
             self.db.execute("UPDATE generations SET status=? WHERE id=?", (status, gid))
-            if messages and status in {"generated", "failed"}:
-                self.db.execute(
-                    "INSERT OR IGNORE INTO events(room,event_id,sender,name,kind,received,parts,causal_anchor) VALUES(?,?,?,?,?,?,?,?)",
-                    (
-                        row["room"],
-                        "generation:" + gid,
-                        self_id,
-                        "bot",
-                        "self",
-                        time.time(),
-                        json.dumps([{"type": "protocol", "messages": messages}], ensure_ascii=False),
-                        row["anchor"],
-                    ),
-                )
+            if messages is not None:
+                wire = json.dumps(messages, ensure_ascii=False)
+                if "data:image/" in wire or "base64://" in wire:
+                    raise ValueError("Execution images must be symbolic")
+                self.db.execute("INSERT OR REPLACE INTO executions VALUES(?,?,?)", (gid, row["scope"], wire))
+
+    def execution(self, gid, scope):
+        row = self.db.execute(
+            "SELECT payload FROM executions WHERE generation=? AND scope=?", (gid, scope)
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def link(self, room, anchor, sources):
+        with self.db:
+            for source in sources:
+                if source != anchor:
+                    self.db.execute("INSERT OR IGNORE INTO turn_links VALUES(?,?,?)", (room, anchor, source))
+
+    def dependencies(self, room, anchor):
+        return [
+            r[0]
+            for r in self.db.execute(
+                "SELECT source FROM turn_links WHERE room=? AND anchor=? ORDER BY source", (room, anchor)
+            )
+        ]
+
+    def segment(self, room, scope):
+        row = self.db.execute(
+            "SELECT payload FROM segments WHERE room=? AND scope=?", (room, scope)
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def save_segment(self, room, scope, payload):
+        wire = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        if "data:image/" in wire or "base64://" in wire:
+            raise ValueError("Segment images must be symbolic")
+        with self.db:
+            self.db.execute(
+                "INSERT OR REPLACE INTO segments VALUES(?,?,?,?)", (room, scope, wire, time.time())
+            )
+
+    def diagnose(self, room, scope, phase, payload):
+        previous = self.db.execute(
+            "SELECT payload FROM diagnostics WHERE room=? AND scope=? AND phase=? ORDER BY id DESC LIMIT 1",
+            (room, scope, phase),
+        ).fetchone()
+        old = json.loads(previous[0]) if previous else {}
+        common = 0
+        for before, after in zip(old.get("messages", []), payload.get("messages", [])):
+            if before != after:
+                break
+            common += 1
+        payload["common_prefix_messages"] = (
+            common
+            if old.get("system") == payload.get("system") and old.get("tools") == payload.get("tools")
+            else 0
+        )
+        payload["first_changed_message"] = payload["common_prefix_messages"] if old else None
+        payload["prefix_change"] = (
+            "first_request"
+            if not old
+            else "system"
+            if old.get("system") != payload.get("system")
+            else "tools"
+            if old.get("tools") != payload.get("tools")
+            else "segment_rollover"
+            if old.get("segment") != payload.get("segment")
+            else "append"
+            if common >= len(old.get("stable", []))
+            else "history_or_attachment"
+        )
+        with self.db:
+            self.db.execute(
+                "INSERT INTO diagnostics(room,scope,phase,payload,created) VALUES(?,?,?,?,?)",
+                (room, scope, phase, json.dumps(payload, sort_keys=True), time.time()),
+            )
+        return payload
 
     def delivery_attempt(self, gid, receipt):
         with self.db:
@@ -387,7 +523,7 @@ class SQLiteRepository:
                 (gid, receipt),
             )
 
-    def sent(self, gid, receipt, platform_id=None):
+    def sent(self, gid, receipt, platform_id=None, parts=None, self_id=""):
         existing = self.db.execute(
             "SELECT status FROM deliveries WHERE generation=? AND receipt=?", (gid, receipt)
         ).fetchone()
@@ -399,7 +535,33 @@ class SQLiteRepository:
                 (gid, receipt, platform_id, time.time()),
             )
             self.db.execute("UPDATE generations SET sent_parts=sent_parts+1 WHERE id=?", (gid,))
+        if parts:
+            self.publish(gid, receipt, parts, self_id, platform_id)
         return True
+
+    def publish(self, gid, receipt, parts, self_id, platform_id=None):
+        row = self.db.execute(
+            "SELECT g.room,g.anchor FROM generations g JOIN deliveries d ON g.id=d.generation WHERE g.id=? AND d.receipt=? AND d.status='sent'",
+            (gid, receipt),
+        ).fetchone()
+        if not row or not parts:
+            return None
+        eid = platform_id or "delivery:" + receipt
+        with self.db:
+            self.db.execute(
+                "INSERT OR IGNORE INTO events(room,event_id,sender,name,kind,received,parts,causal_anchor) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    row["room"],
+                    eid,
+                    self_id,
+                    "bot",
+                    "self",
+                    time.time(),
+                    json.dumps(parts, ensure_ascii=False),
+                    row["anchor"],
+                ),
+            )
+        return self.get(row["room"], eid)
 
     def settle(self, gid, completed=False):
         with self.db:
@@ -429,7 +591,8 @@ class SQLiteRepository:
                 last["status"] = last["delivery"]
         return {
             "events": self.db.execute(
-                "SELECT count(*) FROM events WHERE room=? AND seq>?", (room, self.floor(room))
+                "SELECT count(*) FROM events WHERE room=? AND kind!='execution' AND seq>?",
+                (room, self.floor(room)),
             ).fetchone()[0],
             "media": {
                 r[0]: r[1]
@@ -438,10 +601,17 @@ class SQLiteRepository:
                 )
             },
             "last_generation": last,
+            "diagnostics": [
+                dict(r) | {"payload": json.loads(r["payload"])}
+                for r in self.db.execute(
+                    "SELECT phase,payload FROM diagnostics WHERE room=? ORDER BY id DESC LIMIT 3", (room,)
+                )
+            ],
+            "segments": self.db.execute("SELECT count(*) FROM segments WHERE room=?", (room,)).fetchone()[0],
             "trace": [
                 dict(r)
                 for r in self.db.execute(
-                    "SELECT phase,count(*) AS calls,COALESCE(SUM(input_tokens),0) AS input_tokens,COALESCE(SUM(cached_tokens),0) AS cached_tokens FROM traces WHERE room=? GROUP BY phase",
+                    "SELECT phase,count(*) AS calls,COALESCE(SUM(input_tokens),0) AS input_tokens,COALESCE(SUM(cached_tokens),0) AS cached_tokens, COALESCE(SUM(input_tokens-cached_tokens),0) AS uncached_tokens, AVG(elapsed) AS avg_elapsed FROM traces WHERE room=? GROUP BY phase",
                     (room,),
                 )
             ],
@@ -451,6 +621,8 @@ class SQLiteRepository:
         with self.db:
             self.db.execute("DELETE FROM events WHERE received<?", (cutoff,))
             self.db.execute("DELETE FROM traces WHERE created<?", (cutoff,))
+            self.db.execute("DELETE FROM diagnostics WHERE created<?", (cutoff,))
+            self.db.execute("DELETE FROM segments WHERE updated<?", (cutoff,))
             self.db.execute("DELETE FROM generations WHERE created<?", (cutoff,))
             self.db.execute("DELETE FROM media WHERE status IN ('expired','failed') AND created<?", (cutoff,))
 
@@ -516,14 +688,14 @@ class Journal:
     async def media_update(self, mid, **fields):
         return await self.call("media_update", mid, **fields)
 
-    async def begin(self, room, anchor):
-        return await self.call("begin", room, anchor)
+    async def begin(self, room, anchor, scope=""):
+        return await self.call("begin", room, anchor, scope)
 
     async def finish(self, gid, status, messages=None, self_id=""):
         return await self.call("finish", gid, status, messages, self_id)
 
-    async def sent(self, gid, receipt, platform_id=None):
-        return await self.call("sent", gid, receipt, platform_id)
+    async def sent(self, gid, receipt, platform_id=None, parts=None, self_id=""):
+        return await self.call("sent", gid, receipt, platform_id, parts, self_id)
 
     async def settle(self, gid, completed=False):
         return await self.call("settle", gid, completed)
@@ -566,3 +738,24 @@ class Journal:
 
     async def delivery_failed(self, gid, receipt):
         return await self.call("delivery_failed", gid, receipt)
+
+    async def execution(self, gid, scope=""):
+        return await self.call("execution", gid, scope)
+
+    async def link(self, room, anchor, sources):
+        return await self.call("link", room, anchor, sources)
+
+    async def dependencies(self, room, anchor):
+        return await self.call("dependencies", room, anchor)
+
+    async def segment(self, room, scope):
+        return await self.call("segment", room, scope)
+
+    async def save_segment(self, room, scope, payload):
+        return await self.call("save_segment", room, scope, payload)
+
+    async def diagnose(self, room, scope, phase, payload):
+        return await self.call("diagnose", room, scope, phase, payload)
+
+    async def publish(self, gid, receipt, parts, self_id, platform_id=None):
+        return await self.call("publish", gid, receipt, parts, self_id, platform_id)

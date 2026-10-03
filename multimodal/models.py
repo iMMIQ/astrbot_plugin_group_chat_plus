@@ -103,6 +103,12 @@ class Selection:
     chosen_events: list[Event] = field(default_factory=list)
     tokens: int = 0
     rebases: int = 0
+    seed_seqs: set[int] = field(default_factory=set)
+    frames: dict = field(default_factory=dict)
+    canonical_current: list = field(default_factory=list)
+    segment_id: str = ""
+    rollover: str = ""
+    scope: str = ""
 
 
 @dataclass
@@ -119,6 +125,9 @@ class TurnState:
     receipts: list[Any] = field(default_factory=list)
     started: float = 0.0
     transport: Any = None
+    run_context: Any = None
+    public_messages: list[Message] = field(default_factory=list)
+    media_leases: list[str] = field(default_factory=list)
 
 
 def event_order(event: Event) -> tuple[int, int, int]:

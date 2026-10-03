@@ -64,14 +64,55 @@ class ContextSelector:
                     protected.add(event["seq"])
                     reasons[event["seq"]] = "same_sender_recent_image"
                     primary.update(mids)
-        # Tool exchanges and their user trigger form one indivisible turn.
+        # A quote of a bot answer also restores the actual sources used in that turn.
+        queue = list(references)
+        seen = set()
+        while queue and len(seen) < 32:
+            event = queue.pop(0)
+            if event["seq"] in seen:
+                continue
+            seen.add(event["seq"])
+            parent_seq = event.get("causal_anchor")
+            sources = await self.journal.dependencies(room, parent_seq or event["seq"])
+            if parent_seq:
+                if not sources and event["event_id"].startswith("generation:"):
+                    # v2 did not store dependencies. Recover only the bounded
+                    # implicit same-sender image association of that old turn.
+                    question = await self.journal.by_seq(room, parent_seq)
+                    if question:
+                        legacy = await self.journal.same_sender(
+                            question,
+                            float(self.config.get("association_seconds", 120)),
+                            limit=8,
+                            images_only=True,
+                        )
+                        sources = [e["seq"] for e in legacy]
+                sources = [parent_seq] + sources
+            for seq in sources[:32]:
+                source = await self.journal.by_seq(room, seq)
+                if source and source["seq"] <= trigger:
+                    selected[seq] = source
+                    protected.add(seq)
+                    primary.update(image_ids(source["parts"]))
+                    reasons[seq] = "referenced_turn_source"
+                    queue.append(source)
+        # A public reply and its trigger remain a complete turn when trimming.
+        seed = {e["seq"] for e in recent} | {trigger}
         for event in list(selected.values()):
             if event.get("causal_anchor") is not None:
                 parent = await self.journal.by_seq(room, event["causal_anchor"])
                 if parent:
                     selected[parent["seq"]] = parent
+                    if event["seq"] in seed:
+                        seed.add(parent["seq"])
         return Selection(
-            anchor, sorted(selected.values(), key=event_order), protected, primary, reasons, watermark
+            anchor,
+            sorted(selected.values(), key=event_order),
+            protected,
+            primary,
+            reasons,
+            watermark,
+            seed_seqs=seed,
         )
 
     async def _parts(self, parts, room, selected_media, records):
@@ -148,14 +189,6 @@ class ContextSelector:
         return output
 
     async def _frame(self, event, chosen_media, records):
-        if event["kind"] == "self":
-            messages = [
-                copy.deepcopy(message)
-                for p in event["parts"]
-                if p["type"] == "protocol"
-                for message in p["messages"]
-            ]
-            return {"messages": messages}
         metadata = {
             "event_id": event["event_id"],
             "sender_id": event["sender"],
@@ -167,7 +200,8 @@ class ContextSelector:
             {"type": "text", "text": "[message_metadata=" + json.dumps(metadata, ensure_ascii=False) + "]"}
         ]
         blocks.extend(await self._parts(event["parts"], event["room"], chosen_media, records))
-        return {"messages": [{"role": "user", "content": blocks}]}
+        role = "assistant" if event["kind"] == "self" and not image_ids(event["parts"]) else "user"
+        return {"messages": [{"role": role, "content": blocks}]}
 
     @staticmethod
     def _frame_media(frame):
@@ -179,7 +213,45 @@ class ContextSelector:
             if p.get("type") == "journal_image"
         }
 
-    async def assemble(self, selection, fixed_tokens=0, total_limit=None, reserved_images=0, *, freeze=True):
+    async def assemble(
+        self,
+        selection,
+        fixed_tokens=0,
+        total_limit=None,
+        reserved_images=0,
+        *,
+        freeze=True,
+        frames_override=None,
+        contiguous=False,
+    ):
+        mids = {mid for event in selection.events for mid in image_ids(event["parts"])}
+        if mids:
+            self.media.lease(mids)
+        try:
+            return await self._assemble(
+                selection,
+                fixed_tokens,
+                total_limit,
+                reserved_images,
+                freeze=freeze,
+                frames_override=frames_override,
+                contiguous=contiguous,
+            )
+        finally:
+            if mids:
+                self.media.release(mids)
+
+    async def _assemble(
+        self,
+        selection,
+        fixed_tokens=0,
+        total_limit=None,
+        reserved_images=0,
+        *,
+        freeze=True,
+        frames_override=None,
+        contiguous=False,
+    ):
         limit = min(int(self.config.get("input_token_budget", 32768)), total_limit or 10**9)
         budget = limit - fixed_tokens
         if budget <= 0:
@@ -190,6 +262,9 @@ class ContextSelector:
             [e["seq"] for e in selection.events],
             {mid for event in selection.events for mid in image_ids(event["parts"])},
         )
+
+        if frames_override is not None:
+            frozen = frames_override
 
         def key(mid):
             record = records.get(mid)
@@ -250,6 +325,8 @@ class ContextSelector:
             if len(new_images) <= max_images and cost(new_text, new_images) <= budget:
                 chosen.update(additional)
                 used_images, used_text = new_images, new_text
+            elif contiguous:
+                break
         selected = [event for event in selection.events if event["seq"] in chosen]
         selection.chosen_events = selected
         selection.chosen_media = {mid for mid in records if key(mid) in used_images}
@@ -281,6 +358,8 @@ class ContextSelector:
             new = {event["seq"]: frames[event["seq"]] for event in selected if not frozen.get(event["seq"])}
             if new:
                 frames.update(await self.journal.freeze_many(new))
+        selection.frames = {seq: copy.deepcopy(frames[seq]) for seq in chosen}
+        selection.canonical_current = []
         history, current = [], []
         for event in selected:
             frame = frames[event["seq"]]
@@ -290,6 +369,7 @@ class ContextSelector:
                     wire["content"] = await materialize(wire["content"])
                 if event["seq"] == selection.anchor["seq"]:
                     current = wire["content"]
+                    selection.canonical_current = copy.deepcopy(current)
                 else:
                     history.append(wire)
         # An old frame may have omitted an image or captured its pending state.

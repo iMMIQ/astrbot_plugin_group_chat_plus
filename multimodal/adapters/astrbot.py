@@ -218,8 +218,8 @@ class AstrBotGateway:
         return request
 
     @staticmethod
-    def track_transport(event, journal, gid):
-        return TransportTracker(event, journal, gid)
+    def track_transport(event, journal, gid, on_sent=None):
+        return TransportTracker(event, journal, gid, on_sent)
 
     def execute(self, event, request, provider, on_stats=None):
         return execute(event, self.context, request, provider, on_stats)
@@ -243,13 +243,57 @@ class AstrBotGateway:
         # references in TurnState so Python cannot reuse identities mid-turn.
         return result
 
+    def scope_policy(self, event, provider):
+        cfg = self.context.get_config(umo=event.unified_msg_origin)
+        return {
+            "provider": provider.provider_config.get("id"),
+            "model": provider.get_model(),
+            "fallbacks": cfg.get("agent_runner", {})
+            .get("config", {})
+            .get("model", {})
+            .get("fallback_provider_ids", []),
+            "role": getattr(event, "role", None),
+        }
+
+    async def summarize(self, event, provider, rules, data):
+        import asyncio
+        import json
+        import time
+
+        from astrbot.core.agent.response import AgentStats
+
+        response = None
+        stats = AgentStats()
+        stats.start_time = time.time()
+        try:
+            response = await asyncio.wait_for(
+                strict_provider(provider).text_chat(
+                    prompt=json.dumps(data, ensure_ascii=False),
+                    contexts=[],
+                    system_prompt=rules,
+                    max_tokens=min(2048, int(self.config["summary_token_budget"])),
+                ),
+                15,
+            )
+            if response.usage:
+                stats.token_usage = response.usage
+            return response
+        finally:
+            stats.end_time = time.time()
+            await _record_internal_agent_stats(
+                event,
+                None,
+                SimpleNamespace(provider=provider, stats=stats, was_aborted=lambda: False),
+                response or LLMResponse(role="err", completion_text="summary_failed"),
+            )
+
     async def gate(self, event, provider, history, current):
         import asyncio
         import time
 
         from astrbot.core.agent.response import AgentStats
 
-        from ..bridge import GROUP_RULES
+        from ..bridge import GATE_RULES
 
         stats = AgentStats()
         started = time.time()
@@ -259,8 +303,7 @@ class AstrBotGateway:
                 strict_provider(provider).text_chat(
                     prompt="",
                     contexts=history + [{"role": "user", "content": current}],
-                    system_prompt=GROUP_RULES
-                    + '\n判断是否值得主动参与，严格只返回 JSON {"reply":true或false}。不使用工具。',
+                    system_prompt=GATE_RULES,
                 ),
                 15,
             )
@@ -276,6 +319,36 @@ class AstrBotGateway:
             )
 
 
+class EventBot:
+    """Per-event delegate captures OneBot ACKs that SDK send() discards."""
+
+    def __init__(self, original, tracker):
+        self.original, self.tracker = original, tracker
+
+    def __getattr__(self, name):
+        return getattr(self.original, name)
+
+    async def send_group_msg(self, **kwargs):
+        return await self.tracker.platform_send(self.original.send_group_msg, kwargs)
+
+    async def call_action(self, action, **kwargs):
+        if action == "send_group_forward_msg":
+
+            async def original(**params):
+                return await self.original.call_action(action, **params)
+
+            return await self.tracker.platform_send(original, kwargs, forward=True)
+        return await self.original.call_action(action, **kwargs)
+
+    async def send(self, event, message, **kwargs):
+        async def original(**params):
+            return await self.original.send(event=event, message=message, **kwargs)
+
+        return await self.tracker.platform_send(
+            original, {"group_id": event.get("group_id"), "message": message}
+        )
+
+
 class TransportTracker:
     """Observe this event's real sends; core after-send hooks also fire on failure.
 
@@ -284,8 +357,9 @@ class TransportTracker:
     framework handling while the journal records incomplete delivery.
     """
 
-    def __init__(self, event, journal, gid):
+    def __init__(self, event, journal, gid, on_sent=None):
         self.event, self.journal, self.gid = event, journal, gid
+        self.on_sent = on_sent
         self.original = event.send
         self.previous_override = event.__dict__.get("send")
         self.had_override = "send" in event.__dict__
@@ -293,27 +367,86 @@ class TransportTracker:
         self.successes = 0
         self.wrapper = self.send
         event.send = self.wrapper
+        self.bot_original = None
+        from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+
+        if isinstance(event, AiocqhttpMessageEvent):
+            self.bot_original = event.bot
+            self.bot_proxy = EventBot(event.bot, self)
+            event.bot = self.bot_proxy
+        self.platform_attempts = 0
+
+    async def _ack(self, receipt, result, chain):
+        import asyncio
+
+        from astrbot.api import logger
+
+        platform_id = (
+            str(result["message_id"])
+            if isinstance(result, dict) and result.get("message_id") is not None
+            else None
+        )
+        self.successes += 1
+
+        async def persist():
+            try:
+                await self.journal.sent(self.gid, receipt, platform_id)
+                if self.on_sent:
+                    await self.on_sent(chain, receipt, platform_id)
+            except Exception:
+                logger.exception("[NativeMM] 已发送消息保存失败")
+
+        task = asyncio.create_task(persist())
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+
+    async def platform_send(self, original, kwargs, forward=False):
+        from astrbot.core.message.message_event_result import MessageChain
+
+        if str(kwargs.get("group_id")) != str(self.event.get_group_id()):
+            return await original(**kwargs)
+        self.platform_attempts += 1
+        receipt = self.gid + ":onebot:" + str(self.platform_attempts)
+        await self.journal.delivery_attempt(self.gid, receipt)
+        try:
+            result = await original(**kwargs)
+        except BaseException:
+            await self.journal.delivery_failed(self.gid, receipt)
+            raise
+        parts = kwargs.get("messages", kwargs.get("nodes", [])) if forward else kwargs.get("message", [])
+        if forward:
+            parts = [{"type": "nodes", "nodes": parts}]
+        await self._ack(
+            receipt,
+            result,
+            MessageChain(parts if isinstance(parts, list) else [{"type": "text", "text": str(parts)}]),
+        )
+        return result
 
     async def send(self, chain):
         self.attempts += 1
         receipt = self.gid + ":transport:" + str(self.attempts)
-        await self.journal.delivery_attempt(self.gid, receipt)
+        if not self.bot_original:
+            await self.journal.delivery_attempt(self.gid, receipt)
+        before = self.platform_attempts
         try:
             result = await self.original(chain)
         except BaseException:
-            await self.journal.delivery_failed(self.gid, receipt)
+            if not self.bot_original or self.platform_attempts == before:
+                await self.journal.delivery_attempt(self.gid, receipt)
+                await self.journal.delivery_failed(self.gid, receipt)
             raise
         else:
-            self.successes += 1
-            platform_id = (
-                str(result.get("message_id"))
-                if isinstance(result, dict) and result.get("message_id")
-                else None
-            )
-            await self.journal.sent(self.gid, receipt, platform_id)
+            if not self.bot_original:
+                await self._ack(receipt, result, chain)
             return result
 
     def restore(self):
+        if self.bot_original is not None and self.event.bot is self.bot_proxy:
+            self.event.bot = self.bot_original
         if self.event.send is self.wrapper:
             if self.had_override:
                 self.event.send = self.previous_override
