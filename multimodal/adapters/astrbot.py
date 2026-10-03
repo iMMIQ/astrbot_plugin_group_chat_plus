@@ -7,6 +7,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 from astrbot.api.star import Context
+from astrbot.core.agent.tool import ToolSet
 from astrbot.core.astr_agent_run_util import run_agent
 from astrbot.core.astr_main_agent import build_main_agent, collect_initial_request
 from astrbot.core.pipeline.context import PipelineContext
@@ -73,6 +74,18 @@ class RequestContext(Context):
         return strict_provider(provider) if provider else None
 
 
+def computer_tools_allowed(event, config):
+    # Match the SDK's check_admin_permission; QQ group owner is not bot admin.
+    return not config.get("provider_settings", {}).get("computer_use_require_admin", True) or event.is_admin()
+
+
+def request_agent_config(config, event, session_config):
+    changes = {"streaming_response": False}
+    if not computer_tools_allowed(event, session_config):
+        changes["computer_use_runtime"] = "none"
+    return replace(config, **changes)
+
+
 async def execute(event, context, request, provider, on_stats=None):
     """Yield at the same response boundary as the core local-agent stage."""
     scoped = RequestContext(context)
@@ -89,7 +102,7 @@ async def execute(event, context, request, provider, on_stats=None):
         return
     event.set_extra("provider_request", request)
     collected, _ = await collect_initial_request(event, scoped, native.main_agent_cfg)
-    cfg = replace(native.main_agent_cfg, streaming_response=False)
+    cfg = request_agent_config(native.main_agent_cfg, event, config)
     built = await build_main_agent(
         event=event,
         plugin_context=scoped,
@@ -243,6 +256,21 @@ class AstrBotGateway:
         # references in TurnState so Python cannot reuse identities mid-turn.
         return result
 
+    def filter_tools(self, event, req):
+        cfg = self.context.get_config(umo=event.unified_msg_origin)
+        if not req.func_tool or computer_tools_allowed(event, cfg):
+            return
+        removed = [
+            tool
+            for tool in req.func_tool.tools
+            if type(tool).__module__.startswith("astrbot.core.tools.computer_tools.")
+            or tool.name in {"astrbot_shell_session", "astrbot_execute_shell", "astrbot_execute_python"}
+        ]
+        if removed:
+            # Copy the request's set. Never edit shared managers or tool objects.
+            req.func_tool = ToolSet([tool for tool in req.func_tool.tools if tool not in removed])
+            self.logger.info("[NativeMM] 按本轮权限移除工具=%s", [tool.name for tool in removed])
+
     def scope_policy(self, event, provider):
         cfg = self.context.get_config(umo=event.unified_msg_origin)
         return {
@@ -294,6 +322,7 @@ class AstrBotGateway:
         from astrbot.core.agent.response import AgentStats
 
         from ..bridge import GATE_RULES
+        from ..routing import identity
 
         stats = AgentStats()
         started = time.time()
@@ -303,7 +332,7 @@ class AstrBotGateway:
                 strict_provider(provider).text_chat(
                     prompt="",
                     contexts=history + [{"role": "user", "content": current}],
-                    system_prompt=GATE_RULES,
+                    system_prompt=GATE_RULES + "\n" + identity(event.get_self_id()),
                 ),
                 15,
             )

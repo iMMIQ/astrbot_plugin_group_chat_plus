@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal, NewType, TypedDict
 
+from .routing import TurnRoute
+
 RoomId = NewType("RoomId", str)
 Message = dict[str, Any]
 
@@ -117,6 +119,7 @@ class TurnState:
     gid: str
     provider: Any
     auto: bool = False
+    route: TurnRoute | None = None
     snapshot: dict | None = None
     request: Any = None
     current: list[Part] = field(default_factory=list)

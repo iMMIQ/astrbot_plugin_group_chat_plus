@@ -9,7 +9,7 @@ import logging
 import random
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .adapters.onebot import PlatformAdapter, image_ids, part_type, room_key
 from .adapters.poke import accepted as accept_poke
@@ -21,6 +21,7 @@ from .bridge import GATE_RULES, additions, protocol_messages, request_snapshot, 
 from .context import ContextLimit, ContextSelector
 from .models import TurnState
 from .participation import Participation
+from .routing import TurnRoute, classify, identity
 from .segments import SegmentManager, digest
 from .storage.assets import MediaStore
 from .storage.sqlite import Journal
@@ -67,7 +68,7 @@ class ConversationService:
         restored = self.gateway.restore_wrappers()
         self.cleanup_task = asyncio.create_task(self._cleanup())
         self.logger.info(
-            "[NativeMM] v2.2.0 已加载；旧包装恢复=%s，主动参与=%s",
+            "[NativeMM] v2.2.1 已加载；旧包装恢复=%s，主动参与=%s",
             restored,
             self.config["auto_reply_enabled"],
         )
@@ -145,6 +146,21 @@ class ConversationService:
             anchor, inserted = await self.adapter.ingest(event)
             event.set_extra(OWNER + "_anchor", anchor)
             event.set_extra(OWNER + "_duplicate", not inserted)
+            reply_to_bot = False
+            for part in anchor["parts"]:
+                if part["type"] == "reply":
+                    referenced = await self.journal.get(anchor["room"], part["event_id"])
+                    reply_to_bot = bool(referenced and referenced["sender"] == str(event.get_self_id()))
+                    break
+            route = classify(
+                anchor,
+                event.get_self_id(),
+                framework_wake=bool(event.is_at_or_wake_command),
+                reply_to_bot=reply_to_bot,
+            )
+            event.set_extra(OWNER + "_route", route)
+            if route:
+                event.is_at_or_wake_command = True
             pure = (
                 len(event.get_messages()) == 1
                 and part_type(event.get_messages()[0]) == "at"
@@ -170,7 +186,7 @@ class ConversationService:
         anchor = event.get_extra(OWNER + "_anchor")
         if not anchor or self.gateway.already_handled(event):
             return
-        explicit = bool(event.is_at_or_wake_command)
+        explicit = event.get_extra(OWNER + "_route") is not None or bool(event.is_at_or_wake_command)
         if not explicit and not self.participation.candidate(anchor["room"]):
             return
         async with contextlib.aclosing(self.reply(event, anchor, auto=not explicit)) as flow:
@@ -181,6 +197,9 @@ class ConversationService:
         event.call_llm = True
         if event.get_extra(OWNER + "_duplicate", False):
             return
+        route = event.get_extra(OWNER + "_route") or TurnRoute(
+            str(event.get_self_id()), anchor["event_id"], "auto_approved" if auto else "framework_wake"
+        )
         task = asyncio.current_task()
         self.running_tasks.add(task)
         leased, gid, completed, state = [], None, False, None
@@ -209,6 +228,7 @@ class ConversationService:
                     ]
                     if batch:
                         anchor = batch[-1]
+                        route = replace(route, reason="mention_followup")
                         event.set_extra(OWNER + "_anchor", anchor)
                 selection = await self.selector.candidates(anchor)
                 leased = list({mid for e in selection.events for mid in image_ids(e["parts"])})
@@ -233,7 +253,7 @@ class ConversationService:
                         digest({"provider": provider.provider_config.get("id")}),
                         "gate",
                         {
-                            "system": digest(GATE_RULES),
+                            "system": digest(GATE_RULES + "\n" + identity(event.get_self_id())),
                             "tools": digest([]),
                             "messages": [digest(m) for m in history + [{"role": "user", "content": current}]],
                             "stable": [],
@@ -260,7 +280,13 @@ class ConversationService:
                 if gid is None:
                     return
                 state = TurnState(
-                    selection, gid, provider, auto=auto, started=time.monotonic(), media_leases=leased
+                    selection,
+                    gid,
+                    provider,
+                    auto=auto,
+                    route=route,
+                    started=time.monotonic(),
+                    media_leases=leased,
                 )
 
                 async def public_sent(chain, receipt, platform_id):
@@ -389,6 +415,7 @@ class ConversationService:
                         "completed" if response else "error",
                     )
 
+            self.gateway.filter_tools(event, req)
             _, current = await rewrite(
                 req,
                 state.selection,
@@ -399,6 +426,7 @@ class ConversationService:
                 segments=self.segments,
                 scope_policy=self.gateway.scope_policy(event, state.provider),
                 summarize=summarize,
+                route=state.route,
             )
             await self.journal.link(
                 state.selection.anchor["room"],
@@ -424,7 +452,7 @@ class ConversationService:
                 for p in current
             ]
             self.logger.info(
-                "[NativeMM] anchor=%s trigger_seq=%s view_seq=%s events=%s images=%s tokens_est=%s rebases=%s",
+                "[NativeMM] anchor=%s trigger_seq=%s view_seq=%s events=%s images=%s tokens_est=%s rebases=%s trigger=%s",
                 state.selection.anchor["event_id"],
                 state.selection.anchor["seq"],
                 state.selection.view_seq,
@@ -432,6 +460,7 @@ class ConversationService:
                 count,
                 state.selection.tokens,
                 state.selection.rebases,
+                state.route.reason if state.route else "unknown",
             )
         except Exception as exc:
             await self.journal.finish(state.gid, "failed")
@@ -528,7 +557,7 @@ class ConversationService:
     async def status(self, event):
         if self.enabled(event):
             yield event.plain_result(
-                "NativeMM v2.2.0\n"
+                "NativeMM v2.2.1\n"
                 + json.dumps(await self.journal.status(room_key(event)), ensure_ascii=False)
             )
             event.stop_event()

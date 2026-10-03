@@ -21,7 +21,7 @@ from astrbot.api.star import Context
 from astrbot.core.agent.tool import FunctionTool, ToolSet
 from astrbot.core.config.agent_runner import normalize_agent_runner
 from astrbot.core.config.default import DEFAULT_CONFIG
-from astrbot.core.message.components import At, Image, Plain, Poke
+from astrbot.core.message.components import At, Image, Plain, Poke, Reply
 from astrbot.core.message.message_event_result import ResultContentType
 from astrbot.core.pipeline.context_utils import call_event_hook
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
@@ -192,6 +192,9 @@ async def main():
             assert actual.prompt == "" and "PERSONA_MUST_SURVIVE" in actual.system_prompt
             assert "KB_MUST_SURVIVE" in json.dumps(actual.extra_user_content_parts)
             assert "OLD_CORE_HISTORY" not in json.dumps(actual.contexts)
+            assert "[native_bot_identity=" in actual.system_prompt
+            assert actual.extra_user_content_parts[-1]["text"].startswith("[native_turn_control]")
+            assert state.route.reason == "mention_self"
             assert len(captures) == 1
             body = json.dumps(captures[0], default=str, ensure_ascii=False)
             assert body.count("data:image/png;base64,") == 1
@@ -212,6 +215,9 @@ async def main():
             except StopAsyncIteration:
                 pass
             assert "data:image" not in json.dumps(
+                context.conversation_manager.update_conversation.call_args.kwargs["history"]
+            )
+            assert "native_turn_control" not in json.dumps(
                 context.conversation_manager.update_conversation.call_args.kwargs["history"]
             )
             assert (await plugin.service.journal.status(initial["room"]))["last_generation"][
@@ -257,6 +263,9 @@ async def main():
             state = mention.get_extra(module.OWNER)
             assert state.selection.anchor["event_id"] == "own-followup"
             assert state.selection.anchor["sender"] == "a"
+            assert state.route.reason == "mention_followup" and state.route.source_event_id == "mention"
+            control = json.loads(state.request.extra_user_content_parts[-1]["text"].split("]", 1)[1])
+            assert control["source_event_id"] == "mention" and control["anchor_event_id"] == "own-followup"
             await pure.aclose()
             results["pure_mention_keeps_sender_identity"] = True
 
@@ -283,7 +292,9 @@ async def main():
             )
             toolset = ToolSet()
             toolset.add_tool(tool)
-            context.get_llm_tool_manager.return_value = SimpleNamespace(get_full_tool_set=lambda: toolset)
+            context.get_llm_tool_manager.return_value = SimpleNamespace(
+                get_full_tool_set=lambda: ToolSet(list(toolset.tools)), get_builtin_tool=lambda cls: cls()
+            )
             tool_mode["enabled"] = True
             query = event("tool-probe", [At(qq="fixture-bot"), Plain("tool-probe")])
             await record(plugin, query)
@@ -370,6 +381,77 @@ async def main():
                 "reply": 128,
             }
             results["proactive_gate_and_reply_both_accounted"] = True
+            assert auto_event.get_extra(module.OWNER).route.reason == "auto_approved"
+            assert "[native_bot_identity=" in captures[-2]["system_prompt"]
+            assert "participation" in json.dumps(captures[-1], default=str)
+
+            # Explicit platform facts win over quoted peers and a rejecting gate.
+            plugin.config.update(auto_reply_enabled=False)
+            quoted = event(
+                "quoted-peer-and-at",
+                [Reply(id="interruption"), At(qq="fixture-bot"), Plain("三香包是什么馅")],
+            )
+            quoted.is_at_or_wake_command = False
+            await record(plugin, quoted)
+            with patch.object(plugin.service.gateway, "gate", new=AsyncMock()) as gate:
+                async for _ in plugin.respond(quoted):
+                    pass
+                gate.assert_not_awaited()
+            assert quoted.get_extra(module.OWNER).route.reason == "mention_self"
+            seed = event("reply-seed", [Plain("背景")], group="reply-fixture")
+            await record(plugin, seed)
+            room = seed.get_extra(module.OWNER + "_anchor")["room"]
+            await plugin.service.journal.add(
+                room, "bot-response", "fixture-bot", "bot", [{"type": "text", "text": "answer"}]
+            )
+            follow = event(
+                "reply-bot-confirmed", [Reply(id="bot-response"), Plain("继续说")], group="reply-fixture"
+            )
+            await record(plugin, follow)
+            assert follow.get_extra(module.OWNER + "_route").reason == "reply_self"
+            with patch.object(plugin.service.gateway, "gate", new=AsyncMock()) as gate:
+                async for _ in plugin.respond(follow):
+                    pass
+                gate.assert_not_awaited()
+            results["explicit_at_and_reply_self_bypass_gate"] = True
+
+            # Mirror the actual SDK's permissions before building instructions;
+            # retain unrelated tools and never mutate the shared tool manager.
+            from astrbot.core.tools.computer_tools import ShellSessionTool
+
+            cfg["provider_settings"].update(computer_use_runtime="local", computer_use_require_admin=True)
+            shell = ShellSessionTool()
+            toolset.add_tool(shell)
+            for eid, admin, required, allowed in [
+                ("ordinary-tools", False, True, False),
+                ("admin-tools", True, True, True),
+                ("public-local-tools", False, False, True),
+            ]:
+                cfg["provider_settings"]["computer_use_require_admin"] = required
+                query = event(
+                    eid, [At(qq="fixture-bot"), Plain("三香包是什么馅")], group="permission-fixture"
+                )
+                query.role = "admin" if admin else "member"
+                await record(plugin, query)
+                with patch(
+                    "astrbot.core.astr_main_agent.retrieve_knowledge_base", new=AsyncMock(return_value=None)
+                ):
+                    async for _ in plugin.respond(query):
+                        pass
+                req = query.get_extra(module.OWNER).request
+                names = {t.name for t in req.func_tool.tools}
+                assert ("astrbot_shell_session" in names) is allowed
+                assert ("astrbot_shell_session" in req.system_prompt) is allowed
+                assert "fixture_lookup" in names and shell in toolset.tools
+                assert cfg["provider_settings"]["computer_use_runtime"] == "local"
+            cfg["provider_settings"].update(computer_use_runtime="none", computer_use_require_admin=True)
+            ordinary = event("late-tool-filter", [Plain("question")])
+            req = SimpleNamespace(func_tool=toolset)
+            plugin.service.gateway.filter_tools(ordinary, req)
+            assert req.func_tool is not toolset and shell in toolset.tools
+            assert {t.name for t in req.func_tool.tools} == {"fixture_lookup"}
+            toolset.remove_tool("astrbot_shell_session")
+            results["actual_computer_permissions_filter_tools_and_prompt_without_global_mutation"] = True
 
             # The real RespondStage swallows per-segment errors and still calls
             # after_message_sent. Only observed successful sends count as sent.
