@@ -68,7 +68,7 @@ class ConversationService:
         restored = self.gateway.restore_wrappers()
         self.cleanup_task = asyncio.create_task(self._cleanup())
         self.logger.info(
-            "[NativeMM] v2.2.1 已加载；旧包装恢复=%s，主动参与=%s",
+            "[NativeMM] v2.2.2 已加载；旧包装恢复=%s，主动参与=%s",
             restored,
             self.config["auto_reply_enabled"],
         )
@@ -515,6 +515,10 @@ class ConversationService:
                     + state.public_messages,
                 )
 
+    async def decorate(self, event):
+        if event.get_extra(OWNER):
+            self.gateway.guard_result(event)
+
     async def delivered(self, event):
         state = event.get_extra(OWNER)
         result = self.gateway.receipt(event)
@@ -557,7 +561,7 @@ class ConversationService:
     async def status(self, event):
         if self.enabled(event):
             yield event.plain_result(
-                "NativeMM v2.2.1\n"
+                "NativeMM v2.2.2\n"
                 + json.dumps(await self.journal.status(room_key(event)), ensure_ascii=False)
             )
             event.stop_event()

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 from .adapters.onebot import image_ids
 from .models import Selection, event_order
+from .output import strip_headers
 
 
 class ContextLimit(ValueError):
@@ -199,9 +200,29 @@ class ContextSelector:
         blocks = [
             {"type": "text", "text": "[message_metadata=" + json.dumps(metadata, ensure_ascii=False) + "]"}
         ]
-        blocks.extend(await self._parts(event["parts"], event["room"], chosen_media, records))
-        role = "assistant" if event["kind"] == "self" and not image_ids(event["parts"]) else "user"
-        return {"messages": [{"role": role, "content": blocks}]}
+        if event["kind"] != "self":
+            blocks.extend(await self._parts(event["parts"], event["room"], chosen_media, records))
+            return {"messages": [{"role": "user", "content": blocks}]}
+        # Platform identity/reply/mention/attachment facts are data, never an
+        # assistant output example. Keep the actual sent text in its own role.
+        facts = [p for p in event["parts"] if p["type"] != "text"]
+        blocks.extend(await self._parts(facts, event["room"], chosen_media, records))
+        raw_body = "".join(p["text"] for p in event["parts"] if p["type"] == "text")
+        body = strip_headers(raw_body)
+        if body != raw_body:
+            blocks.append(
+                {
+                    "type": "text",
+                    "text": "[平台记录：此历史消息曾夹带内部格式标记，此处已省略，仅保留回答正文]",
+                }
+            )
+        messages = [{"role": "user", "content": blocks}]
+        if body.strip():
+            blocks.append(
+                {"type": "text", "text": "[下一条 assistant 是此机器人消息的正文，平台记录不属于正文]"}
+            )
+            messages.append({"role": "assistant", "content": [{"type": "text", "text": body}]})
+        return {"messages": messages}
 
     @staticmethod
     def _frame_media(frame):

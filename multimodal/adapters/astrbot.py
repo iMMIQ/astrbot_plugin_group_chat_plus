@@ -31,6 +31,45 @@ class StrictImageOpenAI(ProviderOpenAIOfficial):
 STRICT_CLASSES = {ProviderOpenAIOfficial: StrictImageOpenAI}
 
 
+def guard_chain(chain):
+    from astrbot.api import logger
+    from astrbot.core.message.components import At, Plain, Reply
+
+    from ..output import strip_headers
+
+    output, pending, changed = [], [], False
+
+    def flush():
+        nonlocal changed
+        if not pending:
+            return
+        text = "".join(part.text for part in pending)
+        clean = strip_headers(text)
+        if clean == text:
+            output.extend(pending)
+        else:
+            changed = True
+            if clean.strip():
+                output.append(Plain(clean))
+        pending.clear()
+
+    for part in chain.chain:
+        if isinstance(part, Plain):
+            pending.append(part)
+        else:
+            flush()
+            output.append(part)
+    flush()
+    if not changed:
+        return chain
+    if all(isinstance(part, (At, Reply)) for part in output):
+        output.append(Plain("这次回复格式异常，请再问一次。"))
+    guarded = copy.copy(chain)
+    guarded.chain = output
+    logger.warning("[NativeMM] 已过滤回复中的内部上下文标记")
+    return guarded
+
+
 def strict_provider(provider):
     if not isinstance(provider, ProviderOpenAIOfficial):
         return provider
@@ -236,6 +275,11 @@ class AstrBotGateway:
 
     def execute(self, event, request, provider, on_stats=None):
         return execute(event, self.context, request, provider, on_stats)
+
+    @staticmethod
+    def guard_result(event):
+        if result := event.get_result():
+            event.set_result(guard_chain(result))
 
     @staticmethod
     def already_handled(event):
@@ -456,6 +500,7 @@ class TransportTracker:
         return result
 
     async def send(self, chain):
+        chain = guard_chain(chain)
         self.attempts += 1
         receipt = self.gid + ":transport:" + str(self.attempts)
         if not self.bot_original:

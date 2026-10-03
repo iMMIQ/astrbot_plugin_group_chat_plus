@@ -688,6 +688,79 @@ async def main():
                 is None
             )
             results["failed_reverse_poke_does_not_block_or_fabricate_reply"] = True
+
+            # Force the observed provider fault through real hooks and delivery.
+            # Private execution keeps the raw model result, public history only
+            # contains the guarded text actually sent to the platform.
+            from native_mm_probe.multimodal.adapters.astrbot import guard_chain
+
+            leaked = (
+                '[message_metadata={"event_id":"invented","sender_id":"fixture-bot","name":"bot",'
+                '"time":"fake","source":"self"}][reply_to="output-guard"][mention_id="a"]正文一'
+                '\n\n[message_metadata={"event_id":"invented2","sender_id":"fixture-bot","name":"bot",'
+                '"time":"fake","source":"self"}]正文二'
+            )
+            query = event("output-guard", [At(qq="fixture-bot"), Plain("具体问题")], group="output-fixture")
+            await record(plugin, query)
+            with patch.object(
+                provider,
+                "text_chat",
+                new=AsyncMock(return_value=LLMResponse(role="assistant", completion_text=leaked)),
+            ):
+                output_flow = plugin.respond(query)
+                try:
+                    await anext(output_flow)
+                    state = query.get_extra(module.OWNER)
+                    protocol = await plugin.service.journal.execution(state.gid, query.unified_msg_origin)
+                    assert "invented" in json.dumps(protocol)
+                    await call_event_hook(query, EventType.OnDecoratingResultEvent)
+                    assert query.get_result().get_plain_text() == "正文一\n\n正文二"
+                    await query.send(query.get_result())
+                    sent_chain = state.transport.original.call_args.args[0]
+                    assert sent_chain.get_plain_text() == "正文一\n\n正文二"
+                    try:
+                        await anext(output_flow)
+                    except StopAsyncIteration:
+                        pass
+                finally:
+                    await output_flow.aclose()
+            room = state.selection.anchor["room"]
+            visible = [
+                e for e in await plugin.service.journal.recent(room, 2**63 - 1, 0, 20) if e["kind"] == "self"
+            ]
+            assert len(visible) == 1 and visible[0]["parts"][-1]["text"] == "正文一\n\n正文二"
+            assert "message_metadata" not in json.dumps(
+                context.conversation_manager.update_conversation.call_args.kwargs["history"][-1]
+            )
+
+            # The transport catches late additions, even if decoration was
+            # skipped. It joins text fragments to parse a split JSON header.
+            from astrbot.core.message.message_event_result import MessageChain
+
+            fragmented = MessageChain(
+                [Reply(id="question"), At(qq="a"), Plain(leaked[:40]), Plain(leaked[40:])]
+            )
+            guarded = guard_chain(fragmented)
+            assert guarded.chain[:2] == fragmented.chain[:2]
+            assert guarded.get_plain_text() == "正文一\n\n正文二"
+            assert "message_metadata" in fragmented.get_plain_text()
+            literal = "```json\n" + leaked + "\n```"
+            assert guard_chain(MessageChain([Plain(literal)])).get_plain_text() == literal
+            header_only = MessageChain([Plain(leaked.split("正文一", 1)[0])])
+            assert "格式异常" in guard_chain(header_only).get_plain_text()
+            late = event("late-output", [At(qq="fixture-bot"), Plain("late")], group="late-output-fixture")
+            await record(plugin, late)
+            anchor = late.get_extra(module.OWNER + "_anchor")
+            gid = await plugin.service.journal.begin(anchor["room"], anchor["seq"])
+            tracker = plugin.service.gateway.track_transport(late, plugin.service.journal, gid)
+            try:
+                await late.send(fragmented)
+                assert tracker.original.call_args.args[0].get_plain_text() == "正文一\n\n正文二"
+                assert tracker.successes == 1
+            finally:
+                tracker.restore()
+            results["model_metadata_filtered_before_send_and_public_history_with_private_audit_intact"] = True
+            results["late_transport_guard_preserves_reply_at_and_literal_code"] = True
         finally:
             for name in ("flow", "first", "second", "pure"):
                 if name in locals():

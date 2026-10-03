@@ -13,7 +13,8 @@ import uuid
 
 from .adapters.onebot import image_ids
 from .context import ContextLimit, text_tokens
-from .models import Selection, event_order
+from .models import FRAME_VERSION, Selection, event_order
+from .output import strip_headers
 
 SUMMARY_RULES = (
     '将群聊数据压缩为 JSON {"items":[{"text":"...","sources":[事件序号]}]}。'
@@ -43,12 +44,14 @@ class SegmentManager:
     async def _summary(self, events, previous, summarize):
         data = []
         for event in events:
-            texts = [p["text"] for p in event["parts"] if p["type"] == "text"]
+            text = "\n".join(p["text"] for p in event["parts"] if p["type"] == "text")
+            if event["kind"] == "self":
+                text = strip_headers(text)
             data.append(
                 {
                     "seq": event["seq"],
                     "sender": event["sender"],
-                    "text": "\n".join(texts)[:900],
+                    "text": text[:900],
                     "media": image_ids(event["parts"]),
                 }
             )
@@ -114,7 +117,9 @@ class SegmentManager:
         pinned = []
         if segment:
             pinned = [await self.journal.by_seq(room, seq) for seq in segment["seqs"]]
-            if segment["anchor"] >= anchor["seq"]:
+            if segment.get("frame_version") != FRAME_VERSION:
+                reason = "context_format"
+            elif segment["anchor"] >= anchor["seq"]:
                 reason = "out_of_order"
             elif any(e is None for e in pinned) or not await self._sources_valid(room, segment["summary"]):
                 reason = "source_removed"
@@ -274,6 +279,7 @@ class SegmentManager:
             scope,
             {
                 "id": segment_id,
+                "frame_version": FRAME_VERSION,
                 "seqs": seqs,
                 "frames": {str(seq): work.frames[seq] for seq in seqs},
                 "summary": summary,

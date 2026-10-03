@@ -60,6 +60,10 @@ class ChatPlus(Star):
     async def delivered(self, event):
         await self.service.delivered(event)
 
+    @filter.on_decorating_result(priority=-sys.maxsize)
+    async def decorate(self, event):
+        await self.service.decorate(event)
+
     @filter.command("mmstatus")
     async def status(self, event):
         async for result in self.service.status(event):

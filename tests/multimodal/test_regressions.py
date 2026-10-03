@@ -51,7 +51,7 @@ async def test_queued_turn_sees_completed_previous_reply_but_not_future_members(
     await member(journal, "future member message")
     selection = await selector.candidates(second)
     history, current = await selector.assemble(selection)
-    assert [m["role"] for m in history] == ["user", "assistant"]
+    assert [m["role"] for m in history] == ["user", "user", "assistant"]
     assert history[-1]["content"][-1] == {"type": "text", "text": "answer to first"}
     assert "future member message" not in json.dumps(history)
     assert "second" in json.dumps(current)

@@ -8,6 +8,7 @@ from typing import Any, Literal, NewType, TypedDict
 
 from .routing import TurnRoute
 
+FRAME_VERSION = 2
 RoomId = NewType("RoomId", str)
 Message = dict[str, Any]
 

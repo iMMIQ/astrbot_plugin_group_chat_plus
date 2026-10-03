@@ -11,7 +11,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from ..models import Event, GenerationStatus, Part
+from ..models import FRAME_VERSION, Event, GenerationStatus, Part
 
 
 class SQLiteRepository:
@@ -345,7 +345,9 @@ class SQLiteRepository:
         return [self._event(r) for r in reversed(rows)], watermark
 
     def frame(self, seq):
-        row = self.db.execute("SELECT payload FROM frames WHERE event_seq=? AND version=1", (seq,)).fetchone()
+        row = self.db.execute(
+            "SELECT payload FROM frames WHERE event_seq=? AND version=?", (seq, FRAME_VERSION)
+        ).fetchone()
         return json.loads(row[0]) if row else None
 
     def freeze(self, seq, payload):
@@ -353,7 +355,10 @@ class SQLiteRepository:
         if "data:image/" in wire or "base64://" in wire:
             raise ValueError("Wire image payloads cannot be persisted")
         with self.db:
-            self.db.execute("INSERT OR IGNORE INTO frames VALUES(?,1,?)", (seq, wire))
+            self.db.execute(
+                "INSERT INTO frames VALUES(?,?,?) ON CONFLICT(event_seq) DO UPDATE SET version=excluded.version,payload=excluded.payload WHERE frames.version!=excluded.version",
+                (seq, FRAME_VERSION, wire),
+            )
         return self.frame(seq)
 
     def asset_paths(self):
@@ -412,7 +417,10 @@ class SQLiteRepository:
                 wire = json.dumps(payload, ensure_ascii=False, sort_keys=True)
                 if "data:image/" in wire or "base64://" in wire:
                     raise ValueError("Wire image payloads cannot be persisted")
-                self.db.execute("INSERT OR IGNORE INTO frames VALUES(?,1,?)", (seq, wire))
+                self.db.execute(
+                    "INSERT INTO frames VALUES(?,?,?) ON CONFLICT(event_seq) DO UPDATE SET version=excluded.version,payload=excluded.payload WHERE frames.version!=excluded.version",
+                    (seq, FRAME_VERSION, wire),
+                )
         return {seq: self.frame(seq) for seq in frames}
 
     def begin(self, room, anchor, scope=""):
