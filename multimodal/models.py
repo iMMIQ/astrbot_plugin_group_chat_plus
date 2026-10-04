@@ -8,7 +8,7 @@ from typing import Any, Literal, NewType, TypedDict
 
 from .routing import TurnRoute
 
-FRAME_VERSION = 2
+FRAME_VERSION = 3
 RoomId = NewType("RoomId", str)
 Message = dict[str, Any]
 
@@ -126,6 +126,8 @@ class TurnState:
     current: list[Part] = field(default_factory=list)
     baseline_protocol: list[Message] | None = None
     after_poke_attempted: bool = False
+    action_poke_attempted: bool = False
+    poke_succeeded: bool = False
     receipts: list[Any] = field(default_factory=list)
     started: float = 0.0
     transport: Any = None

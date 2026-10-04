@@ -13,6 +13,7 @@ from dataclasses import dataclass, field, replace
 
 from .adapters.onebot import PlatformAdapter, image_ids, part_type, room_key
 from .adapters.poke import accepted as accept_poke
+from .adapters.poke import description as poke_description
 from .adapters.poke import in_scope as poke_scope
 from .adapters.poke import notice as poke_notice
 from .adapters.poke import probability
@@ -285,6 +286,7 @@ class ConversationService:
                     provider,
                     auto=auto,
                     route=route,
+                    poke_succeeded=bool(event.get_extra(OWNER + "_reverse_poke", False)),
                     started=time.monotonic(),
                     media_leases=leased,
                 )
@@ -297,11 +299,7 @@ class ConversationService:
                 text = "\n".join(p["text"] for p in anchor["parts"] if p["type"] == "text").strip()
                 if not text:
                     poke = next((p for p in anchor["parts"] if p["type"] == "poke"), None)
-                    text = (
-                        "[戳一戳事件=" + json.dumps(poke, ensure_ascii=False) + "]"
-                        if poke
-                        else "[仅附件或@消息]"
-                    )
+                    text = poke_description(poke) if poke else "[仅附件或@消息]"
                 event.set_extra(OWNER + "_retrieval", text)
                 request = self.gateway.prepare(
                     event,
@@ -416,6 +414,18 @@ class ConversationService:
                     )
 
             self.gateway.filter_tools(event, req)
+            if (
+                event.get_platform_name() == "aiocqhttp"
+                and str(event.get_group_id()).isdecimal()
+                and str(state.selection.anchor["sender"]).isdecimal()
+                and poke_scope(self.config, event)
+                and getattr(event, "bot", None) is not None
+            ):
+
+                async def model_poke():
+                    return await self.model_poke(event, state)
+
+                self.gateway.add_poke_tool(event, req, model_poke)
             _, current = await rewrite(
                 req,
                 state.selection,
@@ -535,12 +545,36 @@ class ConversationService:
             state.after_poke_attempted = True
             if (
                 self.config["enable_poke_after_reply"]
+                and not state.poke_succeeded
+                and not state.action_poke_attempted
                 and poke_scope(self.config, event)
                 and random.random() < probability(self.config, "poke_after_reply_probability", 0.15)
             ):
                 await asyncio.sleep(self.config["poke_after_reply_delay"])
                 if not self.closing:
-                    await self.poke(event, state.selection.anchor, "after_reply", state.gid)
+                    if not state.poke_succeeded and not state.action_poke_attempted:
+                        state.action_poke_attempted = True
+                        state.poke_succeeded = await self.poke(
+                            event, state.selection.anchor, "after_reply", state.gid
+                        )
+
+    async def model_poke(self, event, state):
+        if (
+            self.closing
+            or event.get_extra(OWNER) is not state
+            or event.get_extra(OWNER + "_done", False)
+            or not poke_scope(self.config, event)
+        ):
+            return "戳一戳未执行：本轮已结束或不在启用范围内。"
+        if state.poke_succeeded:
+            return "本轮已成功戳过当前发送者，不重复执行。"
+        if state.action_poke_attempted:
+            return "本轮已尝试戳一戳，不重复执行；仅成功结果表示动作已完成。"
+        # Mark before awaiting: duplicate/concurrent calls and automatic sends
+        # cannot retry an action whose platform outcome could be uncertain.
+        state.action_poke_attempted = True
+        state.poke_succeeded = await self.poke(event, state.selection.anchor, "model", state.gid)
+        return "已成功向当前发送者戳一戳。" if state.poke_succeeded else "戳一戳失败，未确认成功。"
 
     async def poke(self, event, anchor, reason, generation=None):
         try:
@@ -561,7 +595,7 @@ class ConversationService:
     async def status(self, event):
         if self.enabled(event):
             yield event.plain_result(
-                "NativeMM v2.2.2\n"
+                "NativeMM v2.2.3\n"
                 + json.dumps(await self.journal.status(room_key(event)), ensure_ascii=False)
             )
             event.stop_event()

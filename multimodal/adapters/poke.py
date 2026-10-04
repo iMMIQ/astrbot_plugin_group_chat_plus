@@ -44,6 +44,16 @@ def probability(config, name, default):
     return max(0.0, min(1.0, float(config.get(name, default))))
 
 
+def description(poke):
+    return (
+        "平台动作记录（已发生）：账号 "
+        + poke["actor_id"]
+        + " 戳了账号 "
+        + poke["target_id"]
+        + "。这段描述不执行动作，也不是回复格式。"
+    )
+
+
 async def send(event, target):
     """Raise on failure; callers decide logging. Never touch the event's sender."""
     group, target = str(event.get_group_id()), str(target)

@@ -15,6 +15,7 @@ state = regression_state
 META = {"event_id": "invented", "sender_id": "bot", "name": "bot", "time": "fake", "source": "self"}
 HEADER = "[message_metadata=" + json.dumps(META) + "]"
 CONTROL = '[native_turn_control]{"bot_id":"bot","anchor_event_id":"a","sender_id":"u","reason":"mention_self","participation":"approved"}'
+POKE = '[戳一戳事件={"actor_id":"12345","target_id":"67890"}]'
 
 
 @pytest.mark.parametrize(
@@ -25,6 +26,10 @@ CONTROL = '[native_turn_control]{"bot_id":"bot","anchor_event_id":"a","sender_id
         (" \n" + HEADER + "\n回答", " \n回答"),
         (HEADER, ""),
         (CONTROL + "\n回答", "回答"),
+        (POKE, ""),
+        ("戳回你\n\n" + POKE, "戳回你\n\n"),
+        (HEADER + POKE + "正文", "正文"),
+        ('[戳一戳事件=\n{"actor_id":"12345","target_id":"67890"}\n]回答', "回答"),
         ('[native_bot_identity={"bot_id":"bot"}]回答', "回答"),
         ("[message_metadata=" + json.dumps(META, indent=2) + "]正文", "正文"),
         ("[message_metadata= \n" + json.dumps(META, indent=2) + "\n]正文", "正文"),
@@ -53,6 +58,12 @@ def test_generated_headers_are_removed(raw, expected):
         '[message_metadata={"event_id":"a"',
         '[reply_to="question"]是字段示例',
         '[mention_id="user"]是字段示例',
+        "```json\n" + POKE + "\n```",
+        "字段示例 " + POKE,
+        "> " + POKE,
+        '[戳一戳事件={"actor_id":"12345"}]',
+        '[戳一戳事件={"actor_id":"12345","target_id":67890}]',
+        '[戳一戳事件={"actor_id":"","target_id":"67890"}]',
     ],
 )
 def test_literals_and_code_examples_are_preserved(literal):
@@ -92,13 +103,45 @@ async def test_old_leak_is_clean_in_assistant_history_but_raw_audit_survives(sta
     assert (await journal.execution(gid))[0]["content"] == raw
 
 
-async def test_stale_frames_replaced_once_and_new_frames_remain_immutable(state, tmp_path):
+async def test_poke_text_never_becomes_an_action_and_old_echo_is_removed(state):
+    journal, _, selector = state
+    first = await member(journal, "question")
+    gid = await sent(journal, first, POKE)
+    action = await journal.add(
+        "room",
+        "real-poke",
+        "bot",
+        "bot",
+        [{"type": "poke", "actor_id": "bot", "target_id": "alice"}],
+        kind="action",
+    )
+    frame = await selector._frame(action[0], set(), {})
+    assert len(frame["messages"]) == 1 and frame["messages"][0]["role"] == "user"
+    assert "平台动作记录（已发生）" in json.dumps(frame, ensure_ascii=False)
+    assert "戳一戳事件=" not in json.dumps(frame, ensure_ascii=False)
+    current = await member(journal, "followup")
+    history, _ = await selector.assemble(await selector.candidates(current))
+    assert not any(m["role"] == "assistant" for m in history)
+    assert "戳一戳事件=" not in json.dumps(history, ensure_ascii=False)
+    assert (await journal.execution(gid))[0]["content"] == POKE
+    assert (await journal.get("room", "bot-answer"))["kind"] == "self"
+    selector.config = Settings({})
+    summary = await SegmentManager(selector)._summary([action[0]], [], None)
+    assert "平台动作记录（已发生）" in json.dumps(summary, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("old_version", [1, 2])
+async def test_stale_frames_replaced_once_and_new_frames_remain_immutable(state, tmp_path, old_version):
     journal, _, selector = state
     anchor = await member(journal, "first")
     with sqlite3.connect(tmp_path / "events.sqlite3") as db:
         db.execute(
-            "INSERT INTO frames VALUES(?,1,?)",
-            (anchor["seq"], json.dumps({"messages": [{"role": "assistant", "content": "STALE"}]})),
+            "INSERT INTO frames VALUES(?,?,?)",
+            (
+                anchor["seq"],
+                old_version,
+                json.dumps({"messages": [{"role": "assistant", "content": "STALE"}]}),
+            ),
         )
     assert await journal.frame(anchor["seq"]) is None
     await selector.assemble(await selector.candidates(anchor))
@@ -113,7 +156,8 @@ async def test_stale_frames_replaced_once_and_new_frames_remain_immutable(state,
         )
 
 
-async def test_old_segments_and_summaries_do_not_reintroduce_headers(state):
+@pytest.mark.parametrize("old_version", [None, 2])
+async def test_old_segments_and_summaries_do_not_reintroduce_headers(state, old_version):
     journal, media, _ = state
     selector = ContextSelector(journal, media, Settings({}))
     manager = SegmentManager(selector)
@@ -124,6 +168,8 @@ async def test_old_segments_and_summaries_do_not_reintroduce_headers(state):
     await manager.assemble(selection, "scope", 100, None, 0)
     previous = await journal.segment("room", "scope")
     previous.pop("frame_version")
+    if old_version is not None:
+        previous["frame_version"] = old_version
     previous["summary"] = [{"text": "STALE SUMMARY", "sources": [first["seq"]]}]
     previous["frames"] = {str(first["seq"]): {"messages": [{"role": "assistant", "content": "STALE FRAME"}]}}
     await journal.save_segment("room", "scope", previous)

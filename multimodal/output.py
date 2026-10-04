@@ -12,6 +12,7 @@ def _header(text, offset, primary=True):
         ("[message_metadata=", "metadata"),
         ("[native_bot_identity=", "identity"),
         ("[native_turn_control]", "control"),
+        ("[戳一戳事件=", "poke"),
         ("[reply_to=", "reference"),
         ("[mention_id=", "reference"),
     ):
@@ -42,6 +43,10 @@ def _header(text, offset, primary=True):
             )
         elif kind == "identity":
             valid = isinstance(value, dict) and isinstance(value.get("bot_id"), str)
+        elif kind == "poke":
+            valid = isinstance(value, dict) and all(
+                isinstance(value.get(key), str) and bool(value[key]) for key in ("actor_id", "target_id")
+            )
         else:
             valid = isinstance(value, str)
         if valid and kind == "control":

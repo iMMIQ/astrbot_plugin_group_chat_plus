@@ -1,6 +1,6 @@
 [project]
 name = "astrbot-plugin-group-chat-plus"
-version = "2.2.2"
+version = "2.2.3"
 requires-python = ">=3.12"
 dependencies = ["aiohttp>=3.8.0", "Pillow>=10.0"]
 

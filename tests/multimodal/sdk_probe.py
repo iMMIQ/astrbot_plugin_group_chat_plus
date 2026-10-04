@@ -630,7 +630,7 @@ async def main():
             flow = plugin.capture(poke_event)
             await anext(flow)
             assert len(captures) == original_count + 1
-            assert "戳一戳事件" in json.dumps(captures[-1], default=str, ensure_ascii=False)
+            assert "平台动作记录（已发生）" in json.dumps(captures[-1], default=str, ensure_ascii=False)
             assert "unsupported_modality" not in json.dumps(captures[-1], default=str)
             poke_event.set_result(
                 poke_event.plain_result("fixture_reply").set_result_content_type(ResultContentType.LLM_RESULT)
@@ -761,6 +761,115 @@ async def main():
                 tracker.restore()
             results["model_metadata_filtered_before_send_and_public_history_with_private_audit_intact"] = True
             results["late_transport_guard_preserves_reply_at_and_literal_code"] = True
+
+            # Replay real core send_message_to_user + native poke calls. The
+            # platform is mocked, but routing, runner, tools, hooks and ACK
+            # publication use the actual SDK. No production messages or stats.
+            from astrbot.core.tools.message_tools import SendMessageToUserTool
+            from native_mm_probe.multimodal.adapters.astrbot import RequestContext
+
+            marker = '[戳一戳事件={"actor_id":"67890","target_id":"12345"}]'
+            toolset.add_tool(SendMessageToUserTool())
+            context.send_message = AsyncMock(return_value=True)
+            plugin.config.update(
+                enable_poke_after_reply=True, poke_after_reply_probability=1, poke_after_reply_delay=0
+            )
+            for failure in (False, True):
+                seed = event(
+                    "native-tool-" + str(failure),
+                    [At(qq="67890"), Plain("戳我")],
+                    sender="12345",
+                    group="86420" if not failure else "86421",
+                )
+                seed.message_obj.self_id = "67890"
+                bot = SimpleNamespace(
+                    api=SimpleNamespace(
+                        call_action=AsyncMock(side_effect=RuntimeError("fixture") if failure else None)
+                    ),
+                    send_group_msg=AsyncMock(side_effect=[{"message_id": 445566}, {"message_id": 445567}]),
+                )
+                query = AiocqhttpMessageEvent(
+                    seed.message_str, seed.message_obj, seed.platform_meta, seed.session_id, bot
+                )
+                query.is_at_or_wake_command = True
+                await record(plugin, query)
+                sequence = [
+                    LLMResponse(
+                        role="assistant",
+                        completion_text="",
+                        tools_call_name=["send_message_to_user"],
+                        tools_call_args=[{"messages": [{"type": "plain", "text": marker + "正文"}]}],
+                        tools_call_ids=["call-send"],
+                    ),
+                    LLMResponse(
+                        role="assistant",
+                        completion_text="",
+                        tools_call_name=["native_poke_current_sender"],
+                        tools_call_args=[{}],
+                        tools_call_ids=["call-poke"],
+                    ),
+                    LLMResponse(
+                        role="assistant",
+                        completion_text="",
+                        tools_call_name=["native_poke_current_sender"],
+                        tools_call_args=[{}],
+                        tools_call_ids=["call-poke-duplicate"],
+                    ),
+                    LLMResponse(role="assistant", completion_text="fixture_reply"),
+                ]
+                with patch.object(provider, "text_chat", new=AsyncMock(side_effect=sequence)):
+                    tool_flow = plugin.respond(query)
+                    try:
+                        await anext(tool_flow)
+                        state = query.get_extra(module.OWNER)
+                        assert context.send_message.await_count == 0  # Same session uses event transport.
+                        assert bot.send_group_msg.call_args.kwargs["message"] == [
+                            {"type": "text", "data": {"text": "正文"}}
+                        ]
+                        assert state.transport.successes == 1
+                        assert query.get_extra("_send_message_to_user_current_session_plain_texts") == [
+                            "正文"
+                        ]
+                        bot.api.call_action.assert_awaited_once_with(
+                            "send_poke", group_id=int(query.get_group_id()), user_id=12345
+                        )
+                        public = await plugin.service.journal.recent(
+                            state.selection.anchor["room"], 2**63 - 1, 0, 20
+                        )
+                        assert len([e for e in public if e["kind"] == "action"]) == (0 if failure else 1)
+                        assert [e for e in public if e["kind"] == "self"][0]["parts"] == [
+                            {"type": "text", "text": "正文"}
+                        ]
+                        raw = await plugin.service.journal.execution(state.gid, query.unified_msg_origin)
+                        arguments = json.loads(raw[0]["tool_calls"][0]["function"]["arguments"])
+                        assert arguments["messages"][0]["text"] == marker + "正文"
+                        assert ("未确认成功" if failure else "已成功向当前发送者") in json.dumps(
+                            raw, ensure_ascii=False
+                        )
+                        action_tool = state.request.func_tool.get_tool("native_poke_current_sender")
+                        wrong_context = SimpleNamespace(context=SimpleNamespace(event=seed))
+                        assert "未执行" in await action_tool.call(wrong_context)
+                        assert "未执行" in await action_tool.call(
+                            SimpleNamespace(context=SimpleNamespace(event=query)), target_id="99999"
+                        )
+                        await query.send(query.get_result())
+                        await call_event_hook(query, EventType.OnAfterMessageSentEvent)
+                        await call_event_hook(query, EventType.OnAfterMessageSentEvent)
+                        assert bot.api.call_action.await_count == 1  # No random duplicate after reply.
+                        try:
+                            await anext(tool_flow)
+                        except StopAsyncIteration:
+                            pass
+                    finally:
+                        await tool_flow.aclose()
+            assert "native_poke_current_sender" not in {t.name for t in toolset.tools}
+            scoped = RequestContext(context, query)
+            elsewhere = MessageChain([Plain("other session")])
+            assert await scoped.send_message("other-session", elsewhere)
+            context.send_message.assert_awaited_once_with("other-session", elsewhere)
+            results["core_message_tool_guarded_and_public_ack_recorded"] = True
+            results["native_poke_tool_success_failure_and_duplicate_calls_match_platform_actions"] = True
+            results["poke_tool_bound_to_current_event_and_shared_tools_unchanged"] = True
         finally:
             for name in ("flow", "first", "second", "pure"):
                 if name in locals():

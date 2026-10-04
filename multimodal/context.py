@@ -8,6 +8,7 @@ import math
 from datetime import datetime, timezone
 
 from .adapters.onebot import image_ids
+from .adapters.poke import description as poke_description
 from .models import Selection, event_order
 from .output import strip_headers
 
@@ -157,11 +158,7 @@ class ContextSelector:
                 output.append(
                     {
                         "type": "text",
-                        "text": "[戳一戳事件="
-                        + json.dumps(
-                            {"actor_id": part["actor_id"], "target_id": part["target_id"]}, ensure_ascii=False
-                        )
-                        + "]",
+                        "text": poke_description(part),
                     }
                 )
             elif kind == "forward":

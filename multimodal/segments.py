@@ -12,6 +12,7 @@ import json
 import uuid
 
 from .adapters.onebot import image_ids
+from .adapters.poke import description as poke_description
 from .context import ContextLimit, text_tokens
 from .models import FRAME_VERSION, Selection, event_order
 from .output import strip_headers
@@ -47,6 +48,9 @@ class SegmentManager:
             text = "\n".join(p["text"] for p in event["parts"] if p["type"] == "text")
             if event["kind"] == "self":
                 text = strip_headers(text)
+            actions = [poke_description(p) for p in event["parts"] if p["type"] == "poke"]
+            if actions:
+                text = "\n".join([text, *actions]).strip()
             data.append(
                 {
                     "seq": event["seq"],

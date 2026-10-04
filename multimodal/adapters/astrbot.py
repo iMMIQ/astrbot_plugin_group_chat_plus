@@ -7,7 +7,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 from astrbot.api.star import Context
-from astrbot.core.agent.tool import ToolSet
+from astrbot.core.agent.tool import FunctionTool, ToolSet
 from astrbot.core.astr_agent_run_util import run_agent
 from astrbot.core.astr_main_agent import build_main_agent, collect_initial_request
 from astrbot.core.pipeline.context import PipelineContext
@@ -92,8 +92,9 @@ def strict_provider(provider):
 class RequestContext(Context):
     """SDK requires Context identity; normal attribute lookup preserves overrides."""
 
-    def __init__(self, original):
+    def __init__(self, original, event=None):
         self.original = original
+        self.event = event
 
     def __getattr__(self, name):
         return getattr(self.original, name)
@@ -103,6 +104,19 @@ class RequestContext(Context):
 
     def get_config(self, *args, **kwargs):
         return self.original.get_config(*args, **kwargs)
+
+    async def send_message(self, session, message_chain):
+        # Core message tools send through Context, bypassing event.send. Route
+        # current-session sends through the owned transport for guards and ACKs.
+        if self.event is not None and str(session) == self.event.unified_msg_origin:
+            guarded = guard_chain(message_chain)
+            await self.event.send(guarded)
+            # Core tools read this local chain after send to suppress duplicate
+            # final replies. They must compare the text actually delivered.
+            if guarded is not message_chain:
+                message_chain.chain = guarded.chain
+            return True
+        return await self.original.send_message(session, message_chain)
 
     def get_provider_by_id(self, provider_id):
         provider = self.original.get_provider_by_id(provider_id)
@@ -127,7 +141,7 @@ def request_agent_config(config, event, session_config):
 
 async def execute(event, context, request, provider, on_stats=None):
     """Yield at the same response boundary as the core local-agent stage."""
-    scoped = RequestContext(context)
+    scoped = RequestContext(context, event)
     config = scoped.get_config(umo=event.unified_msg_origin)
     if not config.get("provider_settings", {}).get("enable", True):
         return
@@ -203,6 +217,27 @@ async def execute(event, context, request, provider, on_stats=None):
                 await on_stats(runner.stats, final_response, stats_runner.was_aborted())
         finally:
             unregister_active_runner(event.unified_msg_origin, runner)
+
+
+class CurrentSenderPokeTool(FunctionTool):
+    """Request-local action; the model cannot choose a room or invent a target."""
+
+    def __init__(self, event, callback):
+        super().__init__(
+            name="native_poke_current_sender",
+            description=(
+                "向当前群聊本轮发送者执行一次真实 QQ 戳一戳。仅在确实想戳对方时调用。"
+                "无需参数，目标由平台确定。以返回值确认成功，不能用普通聊天文字或事件标记代替动作。"
+                "每轮最多一次，已自动戳回时不会重复。"
+            ),
+            parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        )
+        self.event, self.callback = event, callback
+
+    async def call(self, context, **kwargs):
+        if context.context.event is not self.event or kwargs:
+            return "戳一戳未执行：调用不属于本轮，或包含不支持的参数。"
+        return await self.callback()
 
 
 class AstrBotGateway:
@@ -314,6 +349,12 @@ class AstrBotGateway:
             # Copy the request's set. Never edit shared managers or tool objects.
             req.func_tool = ToolSet([tool for tool in req.func_tool.tools if tool not in removed])
             self.logger.info("[NativeMM] 按本轮权限移除工具=%s", [tool.name for tool in removed])
+
+    @staticmethod
+    def add_poke_tool(event, req, callback):
+        tools = ToolSet(list(req.func_tool.tools) if req.func_tool else [])
+        tools.add_tool(CurrentSenderPokeTool(event, callback))
+        req.func_tool = tools
 
     def scope_policy(self, event, provider):
         cfg = self.context.get_config(umo=event.unified_msg_origin)

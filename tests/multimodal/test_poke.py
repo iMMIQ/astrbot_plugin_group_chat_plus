@@ -75,7 +75,8 @@ def test_empty_notice_preserves_identity_and_history(tmp_path):
             (history, current) = await ContextSelector(journal, media, {}).assemble(
                 await ContextSelector(journal, media, {}).candidates(anchor)
             )
-            assert not history and "戳一戳事件" in current[1]["text"]
+            assert not history and "平台动作记录（已发生）" in current[1]["text"]
+            assert "[戳一戳事件=" not in current[1]["text"]
             assert "12345" in current[1]["text"] and "67890" in current[1]["text"]
             assert (await adapter.ingest(ev))[1] is False
             assert ev.get_messages() == []
