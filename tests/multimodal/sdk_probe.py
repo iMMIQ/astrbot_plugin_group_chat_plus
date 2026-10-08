@@ -984,6 +984,140 @@ async def main():
             results["rename_links_full_sender_id_and_history_tool_fallback_in_real_runner"] = True
             results["rename_tail_preserves_scope_frozen_frames_and_shared_history_tool"] = True
             results["legacy_history_keeps_full_ids_scope_watermark_and_reset_boundary"] = True
+
+            # Real OpenAI SDK + core provider, with an in-memory HTTP transport.
+            # Verify the actual serialized body after the core's conversions.
+            import inspect
+
+            from openai import _base_client
+
+            http = getattr(_base_client, "httpx", None) or getattr(_base_client, "httpx2", None)
+            if http is None:
+                http = importlib.import_module("httpx")
+            bodies, wire_records = [], []
+
+            def wire_response(request):
+                body = json.loads(request.content)
+                bodies.append(body)
+                step = len(bodies)
+                choice = {"role": "assistant", "content": "fixture_wire_reply"}
+                finish = "stop"
+                if step == 1 and any(
+                    t.get("function", {}).get("name") == "fixture_lookup" for t in body.get("tools", [])
+                ):
+                    choice = {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "wire-call",
+                                "type": "function",
+                                "function": {"name": "fixture_lookup", "arguments": "{}"},
+                            }
+                        ],
+                    }
+                    finish = "tool_calls"
+                return http.Response(
+                    200,
+                    json={
+                        "id": "fixture-completion",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": body["model"],
+                        "choices": [{"index": 0, "message": choice, "finish_reason": finish}],
+                        "usage": {
+                            "prompt_tokens": 5000 + step * 1000,
+                            "completion_tokens": 20,
+                            "total_tokens": 5020 + step * 1000,
+                            "prompt_tokens_details": {"cached_tokens": step * 2000},
+                        },
+                    },
+                )
+
+            mock_http = http.AsyncClient(transport=http.MockTransport(wire_response))
+            wire_cfg = {
+                "id": "fixture-wire-provider",
+                "type": "openai_chat_completion",
+                "key": ["fixture-key"],
+                "api_base": "https://fixture.invalid/v1",
+                "model": "fixture-wire-model",
+                "modalities": ["text", "image", "tool_use"],
+                "max_context_tokens": 0,
+                "custom_extra_body": {"reasoning_effort": "low"},
+            }
+            with patch.object(
+                runner_module.ProviderOpenAIOfficial, "_create_http_client", new=lambda self, conf: mock_http
+            ):
+                wire_provider = runner_module.ProviderOpenAIOfficial(wire_cfg, cfg["provider_settings"])
+            try:
+                wire_mod = importlib.import_module("native_mm_probe.multimodal.wire")
+
+                async def observe_wire(payload):
+                    wire_records.append(payload)
+
+                observer = wire_mod.WireObserver(observe_wire)
+                before_create = wire_provider.client.chat.completions.create
+                owned = runner_module.strict_provider(wire_provider, observer)
+                another = runner_module.strict_provider(wire_provider, wire_mod.WireObserver(observe_wire))
+                assert owned.client is not wire_provider.client and another.client is not owned.client
+                assert owned.client._client is wire_provider.client._client
+                assert wire_provider.client.chat.completions.create == before_create
+                assert inspect.signature(before_create) != inspect.signature(
+                    owned.client.chat.completions.create
+                )
+                scoped = runner_module.RequestContext(context, observer=observer)
+                with patch.object(context, "get_provider_by_id", return_value=wire_provider):
+                    fallback = scoped.get_provider_by_id("fixture")
+                    assert fallback.client is not wire_provider.client
+                    await fallback.text_chat(prompt="fixture direct call", contexts=[])
+                assert len(wire_records) == 1 and wire_records[0]["input_tokens"] == 6000
+                bodies.clear()
+                wire_records.clear()
+                results["wire_clients_are_request_owned_and_fallbacks_observed"] = True
+
+                context.get_using_provider_async.return_value = wire_provider
+                context.get_provider_by_id.return_value = wire_provider
+
+                async def lookup(ctx):
+                    return "PRIVATE_WIRE_TOOL_RESULT"
+
+                tool.handler = lookup
+                context.get_llm_tool_manager.return_value = SimpleNamespace(
+                    get_full_tool_set=lambda: ToolSet([tool])
+                )
+                wire_query = event(
+                    "wire-question", [At(qq="fixture-bot"), Plain("检查原图与工具"), Image.fromBytes(PNG)]
+                )
+                await record(plugin, wire_query)
+                with patch(
+                    "astrbot.core.astr_main_agent.retrieve_knowledge_base", new=AsyncMock(return_value=None)
+                ):
+                    async for _ in plugin.respond(wire_query):
+                        pass
+                wire_state = wire_query.get_extra(module.OWNER)
+                status = await plugin.service.journal.status(wire_state.selection.anchor["room"])
+                rows = [
+                    r["payload"]
+                    for r in reversed(status["wire_diagnostics"])
+                    if r["payload"]["generation"] == wire_state.gid
+                ]
+                assert len(bodies) == 2 and len(rows) == 2
+                assert [r["stage"] for r in rows] == ["first", "tool"]
+                assert [r["input_tokens"] for r in rows] == [6000, 7000]
+                assert [r["cached_tokens"] for r in rows] == [2000, 4000]
+                assert bodies[0]["reasoning_effort"] == "low" and bodies[0]["tools"]
+                assert rows[0]["tools"] == wire_mod.hashed(bodies[0]["tools"])
+                assert rows[1]["messages"] == [wire_mod.hashed(m) for m in bodies[1]["messages"]]
+                assert rows[0]["images"] == 1 and rows[1]["images"] == 1
+                assert "data:image" not in json.dumps(rows) and "PRIVATE_WIRE" not in json.dumps(rows)
+                assert "tool" in [m["role"] for m in bodies[1]["messages"]]
+                aggregate = stat_sink.await_args.kwargs["stats"]["token_usage"]
+                assert aggregate == {"input_other": 7000, "input_cached": 6000, "output": 40}
+                assert wire_provider.client.chat.completions.create == before_create
+                results["final_sdk_body_image_tools_hashes_and_per_call_usage_match_http"] = True
+                results["first_and_tool_cache_usage_do_not_double_count_core_stats"] = True
+            finally:
+                await wire_provider.client.close()
         finally:
             for name in ("flow", "first", "second", "pure"):
                 if name in locals():

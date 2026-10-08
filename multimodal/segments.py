@@ -181,6 +181,7 @@ class SegmentManager:
             selection.primary_media.copy(),
             selection.reasons.copy(),
             selection.view_seq,
+            estimator=selection.estimator,
         )
         frozen = {int(k): v for k, v in segment["frames"].items()} if segment else {}
         summary_cost = text_tokens(self.summary_message(summary))

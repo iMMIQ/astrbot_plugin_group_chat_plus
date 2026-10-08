@@ -70,7 +70,7 @@ def guard_chain(chain):
     return guarded
 
 
-def strict_provider(provider):
+def strict_provider(provider, observer=None):
     if not isinstance(provider, ProviderOpenAIOfficial):
         return provider
     # Reuse the owned HTTP client without opening/closing a global resource.
@@ -86,15 +86,23 @@ def strict_provider(provider):
     clone.__dict__.update(provider.__dict__)
     clone.provider_config = copy.deepcopy(provider.provider_config)
     clone.api_keys = list(provider.api_keys)
+    if observer is not None:
+        # with_options creates new SDK resources while sharing the original
+        # HTTP pool. Only the original provider owns and closes that pool.
+        clone.client = provider.client.with_options()
+        clone.client.chat.completions.create = observer.wrap(
+            clone.client.chat.completions.create, clone.provider_config
+        )
     return clone
 
 
 class RequestContext(Context):
     """SDK requires Context identity; normal attribute lookup preserves overrides."""
 
-    def __init__(self, original, event=None):
+    def __init__(self, original, event=None, observer=None):
         self.original = original
         self.event = event
+        self.observer = observer
 
     def __getattr__(self, name):
         return getattr(self.original, name)
@@ -120,11 +128,11 @@ class RequestContext(Context):
 
     def get_provider_by_id(self, provider_id):
         provider = self.original.get_provider_by_id(provider_id)
-        return strict_provider(provider) if provider else None
+        return strict_provider(provider, self.observer) if provider else None
 
     async def get_using_provider_async(self, *args, **kwargs):
         provider = await self.original.get_using_provider_async(*args, **kwargs)
-        return strict_provider(provider) if provider else None
+        return strict_provider(provider, self.observer) if provider else None
 
 
 def computer_tools_allowed(event, config):
@@ -139,9 +147,9 @@ def request_agent_config(config, event, session_config):
     return replace(config, **changes)
 
 
-async def execute(event, context, request, provider, on_stats=None):
+async def execute(event, context, request, provider, on_stats=None, observer=None):
     """Yield at the same response boundary as the core local-agent stage."""
-    scoped = RequestContext(context, event)
+    scoped = RequestContext(context, event, observer)
     config = scoped.get_config(umo=event.unified_msg_origin)
     if not config.get("provider_settings", {}).get("enable", True):
         return
@@ -160,7 +168,7 @@ async def execute(event, context, request, provider, on_stats=None):
         event=event,
         plugin_context=scoped,
         config=cfg,
-        provider=strict_provider(provider),
+        provider=strict_provider(provider, observer),
         req=collected,
         apply_reset=False,
     )
@@ -319,15 +327,19 @@ class AstrBotGateway:
             )
         return await manager.get_conversation(event.unified_msg_origin, cid)
 
-    def validate_images(self, event, provider):
-        from ..context import ContextLimit
-
+    def budget_providers(self, event, provider):
         providers = [provider]
         cfg = self.context.get_config(umo=event.unified_msg_origin)
         fallback_ids = (
             cfg.get("agent_runner", {}).get("config", {}).get("model", {}).get("fallback_provider_ids", [])
         )
         providers.extend(self.context.get_provider_by_id(pid) for pid in fallback_ids)
+        return [p for p in providers if p]
+
+    def validate_images(self, event, provider):
+        from ..context import ContextLimit
+
+        providers = self.budget_providers(event, provider)
         if any(p and "image" not in p.provider_config.get("modalities", []) for p in providers):
             raise ContextLimit("当前或备用模型未声明图片输入能力，请调整模型配置。")
 
@@ -345,8 +357,8 @@ class AstrBotGateway:
     def track_transport(event, journal, gid, on_sent=None):
         return TransportTracker(event, journal, gid, on_sent)
 
-    def execute(self, event, request, provider, on_stats=None):
-        return execute(event, self.context, request, provider, on_stats)
+    def execute(self, event, request, provider, on_stats=None, observer=None):
+        return execute(event, self.context, request, provider, on_stats, observer)
 
     @staticmethod
     def guard_result(event):

@@ -6,11 +6,30 @@ import time
 from test_regressions import member, picture
 from test_regressions import state as regression_state
 
+from multimodal.budget import BudgetEstimator
 from multimodal.config import Settings
 from multimodal.context import ContextSelector
 from multimodal.segments import SegmentManager
 
 state = regression_state
+
+
+async def test_calibration_extends_segment_without_changing_frozen_prefix(state):
+    journal, _, _ = state
+    mm = await manager(state, input_token_budget=10000)
+    first = await member(journal, "before-calibration", [{"type": "text", "text": "旅行计划" * 200}])
+    initial, prefix, _, _ = await request(mm, first)
+    frame = await journal.frame(first["seq"])
+    for i in range(3):
+        anchor = await member(journal, "after-" + str(i), [{"type": "text", "text": "旅行计划" * 200}])
+    selection = await mm.selector.candidates(anchor)
+    selection.estimator = BudgetEstimator(text_scale=0.6)
+    stable, _, _ = await mm.assemble(selection, "policy", 100, None, 0)
+    assert selection.segment_id == initial.segment_id
+    assert stable[: len(prefix)] == prefix
+    assert await journal.frame(first["seq"]) == frame
+    assert len(selection.chosen_events) == 4
+    assert selection.tokens <= 10000
 
 
 async def manager(state, **options):

@@ -69,7 +69,7 @@ def request_snapshot(req):
     }
 
 
-def payload_cost(value, image_reserve):
+def payload_cost(value, image_reserve, estimator=None):
     images = 0
 
     def trim(item):
@@ -83,7 +83,10 @@ def payload_cost(value, image_reserve):
             return [trim(v) for v in item]
         return item
 
-    cost = text_tokens(trim(value))
+    trimmed = trim(value)
+    cost = estimator.text(trimmed) if estimator else text_tokens(trimmed)
+    if estimator:
+        image_reserve = estimator.image(image_reserve)
     return cost + images * image_reserve, images
 
 
@@ -131,14 +134,14 @@ async def rewrite(
         retained.append({"type": "image_url", "image_url": {"url": url}})
     extra_dump = retained + list(member_context or [])
     external_cost, external_images = payload_cost(
-        [extensions, extra_dump], int(selector.config.get("image_token_reserve", 1600))
+        [extensions, extra_dump], int(selector.config.get("image_token_reserve", 1600)), selection.estimator
     )
     fixed = (
-        text_tokens(system)
-        + text_tokens(tools)
+        selection.estimator.text(system)
+        + selection.estimator.text(tools)
         + external_cost
-        + text_tokens(prompt_additions)
-        + text_tokens(control)
+        + selection.estimator.text(prompt_additions)
+        + selection.estimator.text(control)
     )
     max_input = max_context - 4096 if max_context > 4096 else None
     scope = digest({"system": system, "tools": tools, "policy": scope_policy})

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal, NewType, TypedDict
 
+from .budget import BudgetEstimator
 from .routing import TurnRoute
 
 FRAME_VERSION = 3
@@ -112,6 +113,7 @@ class Selection:
     segment_id: str = ""
     rollover: str = ""
     scope: str = ""
+    estimator: BudgetEstimator = field(default_factory=BudgetEstimator)
 
 
 @dataclass

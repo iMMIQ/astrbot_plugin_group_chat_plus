@@ -19,6 +19,7 @@ from .adapters.poke import notice as poke_notice
 from .adapters.poke import probability
 from .adapters.poke import send as send_poke
 from .bridge import GATE_RULES, additions, protocol_messages, request_snapshot, rewrite
+from .budget import BudgetEstimator, calibrated, profile_key
 from .context import ContextLimit, ContextSelector
 from .history import identity_part, search
 from .models import TurnState
@@ -27,6 +28,7 @@ from .routing import TurnRoute, classify, identity
 from .segments import SegmentManager, digest
 from .storage.assets import MediaStore
 from .storage.sqlite import Journal
+from .wire import WireObserver
 
 OWNER = "_native_multimodal"
 
@@ -70,7 +72,7 @@ class ConversationService:
         restored = self.gateway.restore_wrappers()
         self.cleanup_task = asyncio.create_task(self._cleanup())
         self.logger.info(
-            "[NativeMM] v2.2.4 已加载；旧包装恢复=%s，主动参与=%s",
+            "[NativeMM] v2.2.5 已加载；旧包装恢复=%s，主动参与=%s",
             restored,
             self.config["auto_reply_enabled"],
         )
@@ -239,6 +241,24 @@ class ConversationService:
                 provider = await self.gateway.provider(event)
                 if provider is None:
                     raise ContextLimit("没有可用的聊天模型。")
+                estimates, budget_profiles = [], []
+                for candidate in self.gateway.budget_providers(event, provider):
+                    model = candidate.get_model()
+                    profile = profile_key(candidate.provider_config, model)
+                    estimates.append(
+                        calibrated(
+                            candidate.provider_config,
+                            await self.journal.budget_samples(profile),
+                            model,
+                        )
+                    )
+                    budget_profiles.append({"profile": profile, **vars(estimates[-1])})
+                selection.estimator = BudgetEstimator(
+                    max(e.text_scale for e in estimates),
+                    max(e.image_scale for e in estimates),
+                    estimates[0].text_samples,
+                    estimates[0].image_samples,
+                )
                 if auto:
                     if not self.participation.claim(anchor["room"]):
                         return
@@ -326,8 +346,27 @@ class ConversationService:
                         else "completed",
                     )
 
+                async def record_wire(payload):
+                    payload.update(
+                        anchor=selection.anchor["seq"],
+                        generation=gid,
+                        segment=selection.segment_id,
+                        rollover=selection.rollover,
+                        text_scale=selection.estimator.text_scale,
+                        image_scale=selection.estimator.image_scale,
+                        budget_profiles=budget_profiles,
+                    )
+                    await self.journal.diagnose(
+                        selection.anchor["room"],
+                        payload["profile"],
+                        "wire_reply_" + payload["stage"],
+                        payload,
+                    )
+
+                observer = WireObserver(record_wire, int(self.config["image_token_reserve"]))
+
                 async with contextlib.aclosing(
-                    self.gateway.execute(event, request, provider, record_stats)
+                    self.gateway.execute(event, request, provider, record_stats, observer)
                 ) as execution:
                     async for _ in execution:
                         yield None
@@ -628,7 +667,7 @@ class ConversationService:
     async def status(self, event):
         if self.enabled(event):
             yield event.plain_result(
-                "NativeMM v2.2.4\n"
+                "NativeMM v2.2.5\n"
                 + json.dumps(await self.journal.status(room_key(event)), ensure_ascii=False)
             )
             event.stop_event()

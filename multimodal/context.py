@@ -9,17 +9,13 @@ from datetime import datetime, timezone
 
 from .adapters.onebot import image_ids
 from .adapters.poke import description as poke_description
+from .budget import text_tokens as text_tokens
 from .models import Selection, event_order
 from .output import strip_headers
 
 
 class ContextLimit(ValueError):
     pass
-
-
-def text_tokens(value):
-    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-    return sum(2 if ord(c) > 127 else 1 / 3 for c in text).__ceil__()
 
 
 class ContextSelector:
@@ -301,8 +297,8 @@ class ContextSelector:
                 if record and record["status"] == "ready"
                 else 1
             )
-            image_costs[key(mid)] = max(
-                int(self.config.get("image_token_reserve", 1600)), min(tiles, 64) * 256
+            image_costs[key(mid)] = selection.estimator.image(
+                max(int(self.config.get("image_token_reserve", 1600)), min(tiles, 64) * 256)
             )
         preferred = set(selection.primary_media)
         ambient = int(self.config.get("background_images", 2))
@@ -320,7 +316,7 @@ class ContextSelector:
             return keys(self._frame_media(frames[seq]))
 
         def text_cost(seq):
-            return text_tokens(frames[seq]) + 120
+            return selection.estimator.text(frames[seq], overhead=120 * len(frames[seq]["messages"]))
 
         groups = {}
         for event in selection.events:

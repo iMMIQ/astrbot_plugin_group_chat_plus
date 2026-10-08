@@ -143,6 +143,7 @@ class SQLiteRepository:
                     created REAL NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS diagnostic_scope ON diagnostics(room,scope,phase,id);
+                CREATE INDEX IF NOT EXISTS diagnostic_provider ON diagnostics(scope,phase,id);
             """.split(";"):
                 if statement.strip():
                     self.db.execute(statement)
@@ -545,6 +546,26 @@ class SQLiteRepository:
             )
         return payload
 
+    def budget_samples(self, scope):
+        # Calibration is provider/model scoped, across rooms, and automatically
+        # expires with diagnostics. Ignore retries/errors and tool continuations.
+        return [
+            dict(r)
+            for r in self.db.execute(
+                "SELECT json_extract(payload,'$.estimate_version') AS estimate_version, "
+                "json_extract(payload,'$.status') AS status, json_extract(payload,'$.stage') AS stage, "
+                "json_extract(payload,'$.input_tokens') AS input_tokens, "
+                "json_extract(payload,'$.raw_text_tokens') AS raw_text_tokens, "
+                "json_extract(payload,'$.images') AS images, "
+                "json_extract(payload,'$.raw_image_tokens') AS raw_image_tokens "
+                "FROM diagnostics WHERE scope=? AND phase='wire_reply_first' "
+                "AND json_extract(payload,'$.status')='completed' "
+                "AND json_extract(payload,'$.input_tokens')>=512 "
+                "ORDER BY id DESC LIMIT 96",
+                (scope,),
+            )
+        ]
+
     def delivery_attempt(self, gid, receipt):
         with self.db:
             self.db.execute(
@@ -640,7 +661,15 @@ class SQLiteRepository:
             "diagnostics": [
                 dict(r) | {"payload": json.loads(r["payload"])}
                 for r in self.db.execute(
-                    "SELECT phase,payload FROM diagnostics WHERE room=? ORDER BY id DESC LIMIT 3", (room,)
+                    "SELECT phase,payload FROM diagnostics WHERE room=? AND phase NOT LIKE 'wire_%' ORDER BY id DESC LIMIT 3",
+                    (room,),
+                )
+            ],
+            "wire_diagnostics": [
+                dict(r) | {"payload": json.loads(r["payload"])}
+                for r in self.db.execute(
+                    "SELECT phase,payload FROM diagnostics WHERE room=? AND phase LIKE 'wire_%' ORDER BY id DESC LIMIT 6",
+                    (room,),
                 )
             ],
             "segments": self.db.execute("SELECT count(*) FROM segments WHERE room=?", (room,)).fetchone()[0],
@@ -798,6 +827,9 @@ class Journal:
 
     async def diagnose(self, room, scope, phase, payload):
         return await self.call("diagnose", room, scope, phase, payload)
+
+    async def budget_samples(self, scope):
+        return await self.call("budget_samples", scope)
 
     async def publish(self, gid, receipt, parts, self_id, platform_id=None):
         return await self.call("publish", gid, receipt, parts, self_id, platform_id)
