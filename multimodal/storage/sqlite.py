@@ -295,6 +295,34 @@ class SQLiteRepository:
             ).fetchall()
         ]
 
+    def member_identities(self, anchor, senders=None):
+        from ..history import identities
+
+        if senders is not None and not senders:
+            return {}
+        sender_clause = " AND sender IN (" + ",".join("?" for _ in senders) + ")" if senders else ""
+        rows = self.db.execute(
+            "SELECT sender,name,MAX(seq) AS latest FROM events "
+            "WHERE room=? AND kind='member' AND seq>? AND seq<=? "
+            "AND EXISTS(SELECT 1 FROM json_each(events.parts) WHERE json_extract(value,'$.type')!='poke') "
+            + sender_clause
+            + " GROUP BY sender,name ORDER BY latest DESC",
+            (anchor["room"], self.floor(anchor["room"]), anchor["seq"], *(senders or [])),
+        ).fetchall()
+        return identities([dict(r) for r in rows])
+
+    def group_history(self, anchor, **kwargs):
+        from ..history import search
+
+        rows = self.db.execute(
+            "SELECT * FROM events WHERE room=? AND kind IN ('member','self') "
+            "AND seq>? AND seq<? AND received<=? ORDER BY seq",
+            (anchor["room"], self.floor(anchor["room"]), anchor["seq"], anchor["received"]),
+        ).fetchall()
+        return search(
+            [self._event(r) for r in rows], self.member_identities(anchor), source="group", **kwargs
+        )
+
     def new_media(self, room, source):
         mid = uuid.uuid4().hex
         with self.db:
@@ -686,6 +714,12 @@ class Journal:
 
     async def same_sender(self, anchor, seconds, **kwargs):
         return await self.call("same_sender", anchor, seconds, **kwargs)
+
+    async def member_identities(self, anchor, senders=None):
+        return await self.call("member_identities", anchor, senders)
+
+    async def group_history(self, anchor, **kwargs):
+        return await self.call("group_history", anchor, **kwargs)
 
     async def new_media(self, room, source):
         return await self.call("new_media", room, source)

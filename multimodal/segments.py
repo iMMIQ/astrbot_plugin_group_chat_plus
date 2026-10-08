@@ -55,6 +55,7 @@ class SegmentManager:
                 {
                     "seq": event["seq"],
                     "sender": event["sender"],
+                    "name": event["name"][:200],
                     "text": text[:900],
                     "media": image_ids(event["parts"]),
                 }
@@ -88,7 +89,7 @@ class SegmentManager:
         except (ValueError, KeyError, TypeError):
             # Verbatim attributed excerpts, not an invented interpretation.
             output = previous + [
-                {"text": d["sender"] + ": " + d["text"][:160], "sources": [d["seq"]]}
+                {"text": d["sender"] + " (" + d["name"] + "): " + d["text"][:160], "sources": [d["seq"]]}
                 for d in data
                 if d["text"]
             ]

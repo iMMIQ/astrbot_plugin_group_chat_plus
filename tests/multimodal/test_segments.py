@@ -147,10 +147,12 @@ async def test_summary_failure_uses_attributed_bounded_excerpts(state):
     anchor = await member(state[0], "decision", [{"type": "text", "text": "周六出发，酒店还没定"}])
 
     async def fail(rules, data):
+        assert data["messages"][0]["sender"] == "alice"
+        assert data["messages"][0]["name"] == "Alice"
         raise TimeoutError
 
     output = await mm._summary([anchor], [], fail)
-    assert output == [{"text": "alice: 周六出发，酒店还没定", "sources": [anchor["seq"]]}]
+    assert output == [{"text": "alice (Alice): 周六出发，酒店还没定", "sources": [anchor["seq"]]}]
 
 
 async def test_diagnostics_are_hash_only_and_distinguish_system_changes(state):

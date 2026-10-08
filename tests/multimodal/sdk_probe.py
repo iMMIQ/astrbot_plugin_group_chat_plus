@@ -870,6 +870,120 @@ async def main():
             results["core_message_tool_guarded_and_public_ack_recorded"] = True
             results["native_poke_tool_success_failure_and_duplicate_calls_match_platform_actions"] = True
             results["poke_tool_bound_to_current_event_and_shared_tools_unchanged"] = True
+
+            # Rename + real history tool loop, entirely in a fixture room.
+            from datetime import datetime, timedelta, timezone
+
+            from astrbot.core.tools.message_tools import GetGroupMessageHistoryTool
+
+            original_history_tool = GetGroupMessageHistoryTool()
+            toolset.add_tool(original_history_tool)
+            old_card = event("alias-old", [Plain("假期酒店很贵")], sender="1234567890", group="alias-fixture")
+            old_card.message_obj.sender.nickname = "Traveler（10.3～10.7 北城）"
+            await record(plugin, old_card)
+            ask = event(
+                "alias-ask",
+                [At(qq="fixture-bot"), Plain("我去哪了")],
+                sender="1234567890",
+                group="alias-fixture",
+            )
+            ask.message_obj.sender.nickname = "小旅"
+            await record(plugin, ask)
+            history_sequence = [
+                LLMResponse(
+                    role="assistant",
+                    completion_text="",
+                    tools_call_name=["get_group_message_history"],
+                    tools_call_args=[{"keyword": "长假", "sender": "1234567890"}],
+                    tools_call_ids=["call-history"],
+                ),
+                LLMResponse(role="assistant", completion_text="fixture_reply"),
+            ]
+            with patch.object(provider, "text_chat", new=AsyncMock(side_effect=history_sequence)) as offline:
+                history_flow = plugin.respond(ask)
+                try:
+                    await anext(history_flow)
+                    alias_state = ask.get_extra(module.OWNER)
+                    encoded = json.dumps(offline.call_args_list[-1].kwargs, default=str, ensure_ascii=False)
+                    assert "same_sender_recent_fallback" in encoded and "Traveler" in encoded
+                    assert "1234567890" in encoded and "酒店很贵" in encoded
+                    history_tool = alias_state.request.func_tool.get_tool("get_group_message_history")
+                    assert history_tool is not original_history_tool
+                    assert toolset.get_tool("get_group_message_history") is original_history_tool
+                    assert "未执行" in await history_tool.call(
+                        SimpleNamespace(context=SimpleNamespace(event=old_card))
+                    )
+                    assert "未执行" in await history_tool.call(
+                        SimpleNamespace(context=SimpleNamespace(event=ask)), room="other"
+                    )
+                    frame = await plugin.service.journal.frame(alias_state.selection.anchor["seq"])
+                    assert "本群成员身份关联" not in json.dumps(frame, ensure_ascii=False)
+                    await ask.send(ask.get_result())
+                    await call_event_hook(ask, EventType.OnAfterMessageSentEvent)
+                    try:
+                        await anext(history_flow)
+                    except StopAsyncIteration:
+                        pass
+                finally:
+                    await history_flow.aclose()
+            renamed = event(
+                "alias-renamed",
+                [At(qq="fixture-bot"), Plain("还记得吗")],
+                sender="1234567890",
+                group="alias-fixture",
+            )
+            renamed.message_obj.sender.nickname = "小旅（常驻南城）"
+            await record(plugin, renamed)
+            rename_flow = plugin.respond(renamed)
+            try:
+                await anext(rename_flow)
+                renamed_state = renamed.get_extra(module.OWNER)
+                tail = json.dumps(renamed_state.request.extra_user_content_parts, ensure_ascii=False)
+                assert "Traveler" in tail and "小旅（常驻南城）" in tail
+                assert renamed_state.selection.scope == alias_state.selection.scope
+                assert await plugin.service.journal.frame(alias_state.selection.anchor["seq"]) == frame
+                assert renamed_state.request.extra_user_content_parts[-1]["text"].startswith(
+                    "[native_turn_control]"
+                )
+                assert "本群成员身份关联" not in renamed_state.request.system_prompt.split("你正在群聊", 1)[0]
+                query_tool = renamed_state.request.func_tool.get_tool("get_group_message_history")
+                ctx = SimpleNamespace(context=SimpleNamespace(event=renamed))
+                cfg["provider_ltm_settings"]["group_message_history_enable"] = True
+                created = datetime.now(timezone.utc) - timedelta(minutes=1)
+                records = [
+                    SimpleNamespace(
+                        id=10,
+                        sender_id="1234567890",
+                        sender_name="更早名片",
+                        created_at=created,
+                        content={"type": "user", "message": [{"type": "plain", "text": "更早旅行"}]},
+                    ),
+                    SimpleNamespace(
+                        id=200,
+                        sender_id="1234567890",
+                        sender_name="未来名片",
+                        created_at=created,
+                        content={"type": "user", "message": [{"type": "plain", "text": "未来正文"}]},
+                    ),
+                ]
+                context.message_history_manager = SimpleNamespace(get=AsyncMock(return_value=records))
+                renamed.set_extra("_current_platform_message_history_id", 100)
+                legacy = json.loads(await query_tool.call(ctx, source="session", sender="更早名片"))
+                assert legacy["messages"][0]["sender_id"] == "1234567890"
+                assert legacy["identities"][0]["current_name"] == "小旅（常驻南城）"
+                assert "未来" not in json.dumps(legacy, ensure_ascii=False)
+                context.message_history_manager.get.assert_awaited_once_with(
+                    platform_id=renamed.get_platform_id(), user_id=renamed.unified_msg_origin, page_size=700
+                )
+                assert "error" in json.loads(await query_tool.call(ctx, source="foreign"))
+                await plugin.service.journal.reset(renamed_state.selection.anchor["room"])
+                assert "error" in json.loads(await query_tool.call(ctx, source="session"))
+                cfg["provider_ltm_settings"]["group_message_history_enable"] = False
+            finally:
+                await rename_flow.aclose()
+            results["rename_links_full_sender_id_and_history_tool_fallback_in_real_runner"] = True
+            results["rename_tail_preserves_scope_frozen_frames_and_shared_history_tool"] = True
+            results["legacy_history_keeps_full_ids_scope_watermark_and_reset_boundary"] = True
         finally:
             for name in ("flow", "first", "second", "pure"):
                 if name in locals():

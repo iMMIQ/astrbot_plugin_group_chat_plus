@@ -20,6 +20,7 @@ from .adapters.poke import probability
 from .adapters.poke import send as send_poke
 from .bridge import GATE_RULES, additions, protocol_messages, request_snapshot, rewrite
 from .context import ContextLimit, ContextSelector
+from .history import identity_part, search
 from .models import TurnState
 from .participation import Participation
 from .routing import TurnRoute, classify, identity
@@ -69,7 +70,7 @@ class ConversationService:
         restored = self.gateway.restore_wrappers()
         self.cleanup_task = asyncio.create_task(self._cleanup())
         self.logger.info(
-            "[NativeMM] v2.2.2 已加载；旧包装恢复=%s，主动参与=%s",
+            "[NativeMM] v2.2.4 已加载；旧包装恢复=%s，主动参与=%s",
             restored,
             self.config["auto_reply_enabled"],
         )
@@ -414,6 +415,37 @@ class ConversationService:
                     )
 
             self.gateway.filter_tools(event, req)
+            anchor = state.selection.anchor
+            senders = {anchor["sender"]}
+            senders.update(e["sender"] for e in state.selection.events[-12:] if e["kind"] == "member")
+            senders.update(p["target_id"] for p in anchor["parts"] if p["type"] == "mention")
+            profiles = await self.journal.member_identities(anchor, senders)
+
+            async def history(source="group", **kwargs):
+                # /mmreset also applies to the legacy session archive: it must
+                # not reopen pre-reset history through a different source.
+                if await self.journal.floor(anchor["room"]) >= anchor["seq"]:
+                    return {"error": "本群上下文已重置，请重新发起查询。"}
+                if source == "group":
+                    return await self.journal.group_history(anchor, **kwargs)
+                if source != "session":
+                    return {"error": "source 必须为 group 或 session。"}
+                floor = await self.journal.floor(anchor["room"])
+                if floor:
+                    return {"error": "本群已设置上下文边界，请使用 source=group 查询边界之后的记录。"}
+                legacy = await self.gateway.session_history(event, anchor)
+                if legacy is None:
+                    return {"error": "框架会话历史未启用，请使用 source=group。"}
+                events, legacy_profiles = legacy
+                for uid, profile in profiles.items():
+                    other = legacy_profiles.get(uid, {"sender_id": uid, "names": []})
+                    legacy_profiles[uid] = {
+                        "sender_id": uid,
+                        "names": list(dict.fromkeys(profile["names"] + other["names"])),
+                    }
+                return search(events, legacy_profiles, source="session", **kwargs)
+
+            self.gateway.add_history_tool(event, req, history)
             if (
                 event.get_platform_name() == "aiocqhttp"
                 and str(event.get_group_id()).isdecimal()
@@ -437,6 +469,7 @@ class ConversationService:
                 scope_policy=self.gateway.scope_policy(event, state.provider),
                 summarize=summarize,
                 route=state.route,
+                member_context=identity_part(profiles, anchor["sender"]),
             )
             await self.journal.link(
                 state.selection.anchor["room"],
@@ -595,7 +628,7 @@ class ConversationService:
     async def status(self, event):
         if self.enabled(event):
             yield event.plain_result(
-                "NativeMM v2.2.3\n"
+                "NativeMM v2.2.4\n"
                 + json.dumps(await self.journal.status(room_key(event)), ensure_ascii=False)
             )
             event.stop_event()
