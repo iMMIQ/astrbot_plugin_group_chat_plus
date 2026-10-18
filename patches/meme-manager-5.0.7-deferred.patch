@@ -1,0 +1,391 @@
+--- a/main.py
++++ b/main.py
+@@ -12,6 +12,7 @@
+ from astrbot.api.star import Context, Star
+ 
+ from .backend.auto_collect import AutoCollectManager
++from .backend.deferred_reply import close_selections
+ from .backend.packs.categories import CategoryManager
+ from .backend.packs.images import IMAGE_EXTENSIONS
+ from .backend.semantic.index import EmbeddingAdapter, index_is_ready
+@@ -284,6 +285,8 @@
+         self._register_web_apis()
+ 
+         self._semantic_initial_rebuild_task = None
++        self._deferred_meme_tasks = set()
++        self._deferred_meme_closing = False
+ 
+     async def initialize(self) -> None:
+         """Start collection on plugin reload as well as initial startup."""
+@@ -987,6 +990,7 @@
+             return dumps_result({"ok": False, "reason": "语义查询失败"})
+ 
+     async def terminate(self):
++        await close_selections(self)
+         if getattr(self, "auto_collect_manager", None):
+             await self.auto_collect_manager.close()
+         install_tasks = list(getattr(self, "_community_install_tasks", set()))
+--- a/mixins/event_handlers.py
++++ b/mixins/event_handlers.py
+@@ -23,6 +23,7 @@
+ from astrbot.core.message.message_event_result import MessageChain, ResultContentType
+ 
+ from ..backend.meme_parser import MemeParser
++from ..backend.deferred_reply import JOB_KEY, DeferredReply, SnapshotEvent, start_selection
+ from ..backend.meme_parser.text_safety import (
+     _protected_reference_spans,
+     strip_internal_image_ref_lines,
+@@ -1046,6 +1047,26 @@
+         if not response or not response.completion_text:
+             return
+ 
++        if event.get_extra("meme_manager_defer_selection") and callable(
++            event.get_extra("meme_manager_deferred_send")
++        ):
++            # Intermediate tool responses are not the final visible reply.
++            if response.tools_call_name:
++                response.completion_text = self._clean_outgoing_plain_text(response.completion_text)
++                return
++            visible = self._clean_outgoing_plain_text(response.completion_text).strip()
++            if visible:
++                if not event.get_extra(JOB_KEY):
++                    worker_event = SnapshotEvent(event)
++                    event.set_extra(JOB_KEY, DeferredReply(worker_event, copy.deepcopy(response)))
++                    event.set_extra("meme_manager_text_delivered", False)
++                response.completion_text = visible
++                if response.result_chain:
++                    for component in response.result_chain.chain:
++                        if isinstance(component, Plain):
++                            component.text = self._clean_outgoing_plain_text(component.text)
++                return
++
+         text = response.completion_text
+         cleaned_text = strip_internal_image_ref_lines(text)
+         if cleaned_text != text:
+@@ -1237,6 +1258,9 @@
+                         cleaned_components.append(component)
+ 
+             # 流式结果同样需要最后一道 Plain 文本清理。
++            if event.get_extra(JOB_KEY):
++                result.chain = cleaned_components
++                return
+             if result.result_content_type == ResultContentType.STREAMING_FINISH:
+                 if isinstance(original_chain, (str, MessageChain, list)):
+                     result.chain = cleaned_components
+@@ -1406,6 +1430,9 @@
+     @filter.after_message_sent()
+     async def _after_message_sent_impl(self, event: AstrMessageEvent):
+         """消息发送后处理。用于发送未混合的表情图片。"""
++        if event.get_extra(JOB_KEY):
++            start_selection(self, event)
++            return
+         pending_images = event.get_extra("meme_manager_pending_images")
+ 
+         try:
+@@ -1571,7 +1598,7 @@
+ 
+     async def _send_meme_image(self, event: AstrMessageEvent, image: Image) -> None:
+         image = await self._ensure_image_send_format(image)
+-        if event.get_platform_name() in {"gewechat", "webchat"}:
++        if event.get_extra("meme_manager_deferred_worker") or event.get_platform_name() in {"gewechat", "webchat"}:
+             await event.send(MessageChain([image]))
+             return
+         await self.context.send_message(event.unified_msg_origin, MessageChain([image]))
+--- /dev/null
++++ b/backend/deferred_reply.py
+@@ -0,0 +1,108 @@
++"""Bounded post-delivery meme selection for explicitly cooperating callers."""
++
++import asyncio
++import copy
++from dataclasses import dataclass
++
++from astrbot.api import logger
++from astrbot.api.provider import LLMResponse
++from astrbot.core.message.components import Image
++from astrbot.core.message.message_event_result import MessageEventResult, ResultContentType
++
++JOB_KEY = "meme_manager_deferred_job"
++TIMEOUT_SECONDS = 15
++MAX_TASKS = 32
++
++
++class SnapshotEvent:
++    """Keep worker selections/results separate from the live response pipeline."""
++
++    def __init__(self, event):
++        self.original = event
++        self.extras = copy.deepcopy(
++            {k: v for k, v in event.get_extra().items() if k.startswith("meme_manager_") and k != JOB_KEY}
++        )
++        self.extras["meme_manager_defer_selection"] = False
++        self.extras["meme_manager_deferred_worker"] = True
++        self.result = None
++        self.sender = event.get_extra("meme_manager_deferred_send")
++
++    def __getattr__(self, name):
++        return getattr(self.original, name)
++
++    def get_extra(self, key=None, default=None):
++        return self.extras if key is None else self.extras.get(key, default)
++
++    def set_extra(self, key, value):
++        self.extras[key] = value
++
++    def get_result(self):
++        return self.result
++
++    def set_result(self, result):
++        self.result = result
++
++    async def send(self, chain):
++        if await self.sender(chain) is False:
++            raise RuntimeError("Deferred delivery no longer belongs to an active context")
++
++
++@dataclass
++class DeferredReply:
++    event: SnapshotEvent
++    response: LLMResponse
++    started: bool = False
++
++
++async def run_selection(owner, job):
++    """Select and send images only; the text has already been delivered."""
++    event = job.event
++    try:
++        async with asyncio.timeout(TIMEOUT_SECONDS):
++            await owner._resp_impl(event, job.response)
++            event.set_result(MessageEventResult(chain=[], result_content_type=ResultContentType.LLM_RESULT))
++            await owner._on_decorating_result_impl(event)
++            result = event.get_result()
++            for component in result.chain if result else []:
++                if isinstance(component, Image):
++                    await owner._send_meme_image(event, component)
++            await owner._after_message_sent_impl(event)
++    except asyncio.CancelledError:
++        raise
++    except Exception as exc:
++        # Optional media failures must not trigger a second text reply.
++        logger.warning("[meme_manager] 异步表情跳过 type=%s", type(exc).__name__)
++    finally:
++        # Do not call after_message_sent again: it could resend pending images.
++        import os
++
++        for path in event.get_extra("meme_manager_temp_files") or []:
++            try:
++                os.remove(path)
++            except OSError:
++                pass
++        event.set_extra("meme_manager_temp_files", None)
++
++
++def start_selection(owner, event):
++    job = event.get_extra(JOB_KEY)
++    if not job or job.started or not event.get_extra("meme_manager_text_delivered"):
++        return
++    job.started = True
++    tasks = getattr(owner, "_deferred_meme_tasks", None)
++    if tasks is None:
++        tasks = owner._deferred_meme_tasks = set()
++    if getattr(owner, "_deferred_meme_closing", False) or len(tasks) >= MAX_TASKS:
++        return
++    task = asyncio.create_task(run_selection(owner, job))
++    tasks.add(task)
++    task.add_done_callback(tasks.discard)
++
++
++async def close_selections(owner):
++    owner._deferred_meme_closing = True
++    tasks = list(getattr(owner, "_deferred_meme_tasks", ()))
++    for task in tasks:
++        task.cancel()
++    if tasks:
++        await asyncio.gather(*tasks, return_exceptions=True)
+--- /dev/null
++++ b/tests/test_deferred_replies.py
+@@ -0,0 +1,184 @@
++import asyncio
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++import pytest
++from astrbot.api.provider import LLMResponse
++from astrbot.core.message.components import Image, Plain
++from astrbot.core.message.message_event_result import MessageEventResult, ResultContentType
++from astrbot_plugin_meme_manager.backend import deferred_reply
++from astrbot_plugin_meme_manager.backend.deferred_reply import JOB_KEY, close_selections
++from astrbot_plugin_meme_manager.main import MemeSender
++from astrbot_plugin_meme_manager.mixins.event_handlers import LLM_REQUEST_ORIGIN_EXTRA_KEY
++from PIL import Image as PillowImage
++
++
++@pytest.fixture
++def deferred(tmp_path):
++    sender = object.__new__(MemeSender)
++    sender.config = {"generation": {}}
++    sender.category_mapping = {"happy": "开心"}
++    sender.trigger_scope = "only_chat_llm"
++    sender.content_cleanup_rule = r"&&[a-zA-Z]*&&"
++    sender._semantic_mode_active = lambda event: False
++    sender._resolve_runtime_pack_context = lambda **kwargs: {
++        "category_mapping": sender.category_mapping,
++        "pack_dir": tmp_path,
++    }
++    sender._send_meme_image = AsyncMock()
++    sender._deferred_meme_tasks = set()
++    sender._deferred_meme_closing = False
++    sender.filter_all_tags = False
++    state = {
++        LLM_REQUEST_ORIGIN_EXTRA_KEY: "chat",
++        "meme_manager_defer_selection": True,
++        "meme_manager_deferred_send": AsyncMock(return_value=True),
++    }
++    event = SimpleNamespace(
++        get_extra=lambda key=None, default=None: state if key is None else state.get(key, default),
++        set_extra=lambda key, value: state.update({key: value}),
++        get_result=lambda: state.get("result"),
++        get_platform_name=lambda: "aiocqhttp",
++    )
++    return sender, event, state
++
++
++async def drain(sender):
++    tasks = list(sender._deferred_meme_tasks)
++    if tasks:
++        await asyncio.gather(*tasks)
++
++
++@pytest.mark.asyncio
++async def test_text_and_decorating_finish_without_selection_or_sending(deferred):
++    sender, event, state = deferred
++    sender._emotion_llm_generate = AsyncMock(side_effect=AssertionError("must not run before text"))
++    response = LLMResponse(role="assistant", completion_text="你好 &&happy&& `&&happy&&`")
++    await asyncio.wait_for(sender._resp_impl(event, response), 0.5)
++    assert response.completion_text == "你好  `&&happy&&`"
++    state["result"] = MessageEventResult(
++        chain=[Plain(response.completion_text)], result_content_type=ResultContentType.LLM_RESULT
++    )
++    await sender._on_decorating_result_impl(event)
++    await sender._after_message_sent_impl(event)  # A failed send still fires this hook in the SDK.
++    assert not sender._deferred_meme_tasks
++    sender._emotion_llm_generate.assert_not_awaited()
++    sender._send_meme_image.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_successful_text_starts_one_worker_and_preserves_snapshot(deferred):
++    sender, event, state = deferred
++    response = LLMResponse(role="assistant", completion_text="正文 &&happy&&")
++    state["meme_manager_runtime_pack_id"] = "original-pack"
++    await sender._resp_impl(event, response)
++    assert not sender._deferred_meme_tasks
++    job = state[JOB_KEY]
++    state["meme_manager_runtime_pack_id"] = "later-pack"
++    gate = asyncio.Event()
++
++    async def select(worker_event, snapshot):
++        assert worker_event.get_extra("meme_manager_runtime_pack_id") == "original-pack"
++        assert snapshot.completion_text == "正文 &&happy&&"
++        await gate.wait()
++        worker_event.set_extra("found_emotions", ["happy"])
++
++    async def decorate(worker_event):
++        worker_event.get_result().chain = [Plain("must never resend text"), Image.fromBase64("fixture")]
++
++    sender._resp_impl = select
++    sender._on_decorating_result_impl = decorate
++    state["meme_manager_text_delivered"] = True
++    await sender._after_message_sent_impl(event)
++    await sender._after_message_sent_impl(event)
++    assert len(sender._deferred_meme_tasks) == 1
++    gate.set()
++    await drain(sender)
++    sender._send_meme_image.assert_awaited_once()
++    assert sender._send_meme_image.await_args.args[0] is job.event
++    assert "found_emotions" not in state
++
++
++@pytest.mark.asyncio
++async def test_tool_intermediate_does_not_consume_final_reply(deferred):
++    sender, event, state = deferred
++    await sender._resp_impl(
++        event, LLMResponse(role="assistant", completion_text="先查询", tools_call_name=["lookup"])
++    )
++    assert JOB_KEY not in state
++    await sender._resp_impl(event, LLMResponse(role="assistant", completion_text="最终正文"))
++    assert JOB_KEY in state
++
++
++@pytest.mark.asyncio
++async def test_selection_timeout_never_sends_or_repeats_body(deferred, monkeypatch):
++    sender, event, state = deferred
++    await sender._resp_impl(event, LLMResponse(role="assistant", completion_text="正文"))
++    waiting = asyncio.Event()
++    sender._resp_impl = AsyncMock(side_effect=lambda *args: None)
++
++    async def slow(*args):
++        await waiting.wait()
++
++    sender._resp_impl = slow
++    monkeypatch.setattr(deferred_reply, "TIMEOUT_SECONDS", 0.01)
++    state["meme_manager_text_delivered"] = True
++    await sender._after_message_sent_impl(event)
++    await drain(sender)
++    sender._send_meme_image.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_refresh_cancels_workers_and_prevents_new_ones(deferred):
++    sender, event, state = deferred
++    await sender._resp_impl(event, LLMResponse(role="assistant", completion_text="正文"))
++
++    async def slow(*args):
++        await asyncio.Event().wait()
++
++    sender._resp_impl = slow
++    state["meme_manager_text_delivered"] = True
++    await sender._after_message_sent_impl(event)
++    await asyncio.sleep(0)
++    await close_selections(sender)
++    assert not sender._deferred_meme_tasks
++    sender._send_meme_image.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_deferred_image_uses_ack_callback_instead_of_global_context(deferred):
++    sender, event, state = deferred
++    sender.send_image_as_base64 = False
++    sender.context = SimpleNamespace(send_message=AsyncMock())
++    state["meme_manager_deferred_worker"] = True
++    event.send = AsyncMock()
++    await MemeSender._send_meme_image(sender, event, Image.fromBase64("fixture"))
++    event.send.assert_awaited_once()
++    sender.context.send_message.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("probability", [0, 100])
++async def test_real_legacy_selection_runs_after_ack_only(deferred, tmp_path, probability):
++    sender, event, state = deferred
++    directory = tmp_path / "happy"
++    directory.mkdir()
++    PillowImage.new("RGB", (2, 2)).save(directory / "fixture.png")
++    sender.emotions_probability = probability
++    sender.emotion_llm_enabled = True
++    sender.remove_invalid_alternative_markup = False
++    sender.convert_static_to_gif = False
++    sender.enable_mixed_message = False
++    sender.send_image_as_base64 = False
++    sender._get_runtime_memes_dir_for_event = lambda event: tmp_path
++    sender._emotion_llm_generate = AsyncMock(
++        return_value=LLMResponse(role="assistant", completion_text='{"emotions":["happy"]}')
++    )
++    response = LLMResponse(role="assistant", completion_text="正文")
++    await sender._resp_impl(event, response)
++    sender._emotion_llm_generate.assert_not_awaited()
++    state["meme_manager_text_delivered"] = True
++    await sender._after_message_sent_impl(event)
++    await drain(sender)
++    assert sender._send_meme_image.await_count == (1 if probability else 0)
++    assert response.completion_text == "正文"

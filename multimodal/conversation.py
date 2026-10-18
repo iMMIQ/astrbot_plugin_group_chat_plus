@@ -72,7 +72,7 @@ class ConversationService:
         restored = self.gateway.restore_wrappers()
         self.cleanup_task = asyncio.create_task(self._cleanup())
         self.logger.info(
-            "[NativeMM] v2.2.5 已加载；旧包装恢复=%s，主动参与=%s",
+            "[NativeMM] v2.2.6 已加载；旧包装恢复=%s，主动参与=%s",
             restored,
             self.config["auto_reply_enabled"],
         )
@@ -207,6 +207,7 @@ class ConversationService:
         task = asyncio.current_task()
         self.running_tasks.add(task)
         leased, gid, completed, state = [], None, False, None
+        released = asyncio.Event()
         try:
             async with self.room(anchor["room"]):
                 if self.closing:
@@ -317,6 +318,23 @@ class ConversationService:
 
                 state.transport = self.gateway.track_transport(event, self.journal, gid, public_sent)
                 event.set_extra(OWNER, state)
+                event.set_extra("meme_manager_defer_selection", True)
+
+                async def send_meme_later(chain):
+                    task = asyncio.current_task()
+                    self.running_tasks.add(task)
+                    try:
+                        await released.wait()
+                        if self.closing or await self.journal.floor(anchor["room"]) >= anchor["seq"]:
+                            return False
+                        await state.transport.send_late(chain)
+                        return True
+                    finally:
+                        if not self.closing:
+                            await self.journal.settle(gid, completed=True)
+                        self.running_tasks.discard(task)
+
+                event.set_extra("meme_manager_deferred_send", send_meme_later)
                 text = "\n".join(p["text"] for p in anchor["parts"] if p["type"] == "text").strip()
                 if not text:
                     poke = next((p for p in anchor["parts"] if p["type"] == "poke"), None)
@@ -393,6 +411,7 @@ class ConversationService:
                 await self.journal.settle(gid, completed=completed)
             self.media.release(leased)
             self.running_tasks.discard(task)
+            released.set()
 
     async def record_usage(self, selection, phase, provider, usage, elapsed, images, status):
         try:
@@ -485,6 +504,18 @@ class ConversationService:
                 return search(events, legacy_profiles, source="session", **kwargs)
 
             self.gateway.add_history_tool(event, req, history)
+
+            async def image(media_id):
+                visible = {mid for item in state.selection.chosen_events for mid in image_ids(item["parts"])}
+                if media_id not in visible:
+                    return None
+                self.media.lease([media_id])
+                try:
+                    return await self.media.data_uri(media_id, anchor["room"])
+                finally:
+                    self.media.release([media_id])
+
+            self.gateway.add_image_tool(event, req, image)
             if (
                 event.get_platform_name() == "aiocqhttp"
                 and str(event.get_group_id()).isdecimal()
@@ -587,6 +618,8 @@ class ConversationService:
         if public:
             # The core mirror must also contain only observed public deliveries.
             texts = [p["text"] for p in public["parts"] if p["type"] == "text"]
+            if any(text.strip() for text in texts):
+                event.set_extra("meme_manager_text_delivered", True)
             state.public_messages.append(
                 {"role": "assistant", "content": "\n".join(texts) or "[机器人已发送附件]"}
             )
@@ -667,7 +700,7 @@ class ConversationService:
     async def status(self, event):
         if self.enabled(event):
             yield event.plain_result(
-                "NativeMM v2.2.5\n"
+                "NativeMM v2.2.6\n"
                 + json.dumps(await self.journal.status(room_key(event)), ensure_ascii=False)
             )
             event.stop_event()

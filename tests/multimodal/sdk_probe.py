@@ -797,8 +797,13 @@ async def main():
                     LLMResponse(
                         role="assistant",
                         completion_text="",
-                        tools_call_name=["send_message_to_user"],
-                        tools_call_args=[{"messages": [{"type": "plain", "text": marker + "正文"}]}],
+                        tools_call_name=["send_message_to_other_session"],
+                        tools_call_args=[
+                            {
+                                "messages": [{"type": "plain", "text": marker + "正文"}],
+                                "session_id": query.unified_msg_origin,
+                            }
+                        ],
                         tools_call_ids=["call-send"],
                     ),
                     LLMResponse(
@@ -822,14 +827,16 @@ async def main():
                     try:
                         await anext(tool_flow)
                         state = query.get_extra(module.OWNER)
+                        assert state.request.func_tool.get_tool("send_message_to_user") is None
+                        assert state.request.func_tool.get_tool("send_message_to_other_session") is not None
+                        await RequestContext(context, query).send_message(
+                            query.unified_msg_origin, MessageChain([Plain(marker + "正文")])
+                        )
                         assert context.send_message.await_count == 0  # Same session uses event transport.
                         assert bot.send_group_msg.call_args.kwargs["message"] == [
                             {"type": "text", "data": {"text": "正文"}}
                         ]
                         assert state.transport.successes == 1
-                        assert query.get_extra("_send_message_to_user_current_session_plain_texts") == [
-                            "正文"
-                        ]
                         bot.api.call_action.assert_awaited_once_with(
                             "send_poke", group_id=int(query.get_group_id()), user_id=12345
                         )
@@ -1118,6 +1125,105 @@ async def main():
                 results["first_and_tool_cache_usage_do_not_double_count_core_stats"] = True
             finally:
                 await wire_provider.client.close()
+
+            # Cross-session capability remains available without exposing the
+            # ordinary reply as a message-tool round trip.
+            from native_mm_probe.multimodal.adapters.astrbot import OtherSessionMessageTool
+
+            original = Mock(spec=FunctionTool)
+            original.parameters = {
+                "type": "object",
+                "properties": {"session_id": {"type": "string"}},
+                "required": [],
+            }
+            original.call = AsyncMock(return_value="fixture cross-session delivery")
+            bound = OtherSessionMessageTool(query, original)
+            ctx = SimpleNamespace(context=SimpleNamespace(event=query))
+            prefix = query.unified_msg_origin.rsplit(":", 1)[0]
+            for session in [
+                None,
+                "",
+                query.unified_msg_origin,
+                " " + query.unified_msg_origin + " ",
+                prefix + ":999_" + query.get_group_id(),
+            ]:
+                assert "未发送" in await bound.call(ctx, session_id=session, messages=[])
+            original.call.assert_not_awaited()
+            assert (
+                await bound.call(ctx, session_id="other-session", messages=[])
+                == "fixture cross-session delivery"
+            )
+            assert original.parameters["required"] == []
+            results["ordinary_reply_tool_replaced_and_cross_session_capability_preserved"] = True
+
+            context.get_using_provider_async.return_value = provider
+            context.get_provider_by_id.return_value = provider
+            tool_mode["enabled"] = False
+            plugin.config.update(enable_poke_after_reply=False)
+            seed = event(
+                "late-meme", [At(qq="67890"), Plain("fixture reply")], sender="12345", group="9123487"
+            )
+            seed.message_obj.self_id = "67890"
+            bot = SimpleNamespace(
+                send_group_msg=AsyncMock(
+                    side_effect=[
+                        {"message_id": 8001},
+                        {"message_id": 8002},
+                        RuntimeError("fixture late failure"),
+                    ]
+                )
+            )
+            late = AiocqhttpMessageEvent(
+                seed.message_str, seed.message_obj, seed.platform_meta, seed.session_id, bot
+            )
+            late.is_at_or_wake_command = True
+            await record(plugin, late)
+            flow = plugin.respond(late)
+            pending = None
+            try:
+                await anext(flow)
+                state = late.get_extra(module.OWNER)
+                await late.send(MessageChain([Plain("fixture body")]))
+                assert late.get_extra("meme_manager_text_delivered") is True
+                callback = late.get_extra("meme_manager_deferred_send")
+                pending = asyncio.create_task(callback(MessageChain([Image.fromBytes(PNG)])))
+                await asyncio.sleep(0)
+                assert not pending.done() and bot.send_group_msg.await_count == 1
+                try:
+                    await anext(flow)
+                except StopAsyncIteration:
+                    pass
+                assert await pending is True
+                assert late.bot is bot and late.send != state.transport.wrapper
+                public = await plugin.service.journal.recent(state.selection.anchor["room"], 2**63 - 1, 0, 20)
+                sent = [e for e in public if e["kind"] == "self"]
+                assert {e["event_id"] for e in sent} == {"8001", "8002"}
+                assert any(p["type"] == "image" for e in sent for p in e["parts"])
+                try:
+                    await callback(MessageChain([Image.fromBytes(PNG)]))
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("late failure was swallowed")
+                public_after = await plugin.service.journal.recent(
+                    state.selection.anchor["room"], 2**63 - 1, 0, 20
+                )
+                assert len([e for e in public_after if e["kind"] == "self"]) == 2
+                assert (await plugin.service.journal.status(state.selection.anchor["room"]))[
+                    "last_generation"
+                ]["delivery"] == "partial"
+                await plugin.service.journal.reset(state.selection.anchor["room"])
+                assert await callback(MessageChain([Image.fromBytes(PNG)])) is False
+                assert bot.send_group_msg.await_count == 3
+                results["deferred_meme_waits_for_queue_release_and_records_real_ack_without_rewrapping"] = (
+                    True
+                )
+                results["late_image_failure_and_reset_do_not_publish_or_retry_messages"] = True
+            finally:
+                await flow.aclose()
+                if pending and not pending.done():
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
         finally:
             for name in ("flow", "first", "second", "pure"):
                 if name in locals():

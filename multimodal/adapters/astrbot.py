@@ -248,6 +248,85 @@ class CurrentSenderPokeTool(FunctionTool):
         return await self.callback()
 
 
+class OtherSessionMessageTool(FunctionTool):
+    """Keep explicit cross-session delivery separate from an ordinary reply."""
+
+    def __init__(self, event, original):
+        parameters = copy.deepcopy(original.parameters)
+        parameters["required"] = list(dict.fromkeys(parameters.get("required", []) + ["session_id"]))
+        super().__init__(
+            name="send_message_to_other_session",
+            description="仅在明确要求向其他会话发送消息时使用。必须提供其他会话的 session_id。回复当前群请直接输出正文。",
+            parameters=parameters,
+        )
+        self.event, self.original = event, original
+
+    async def call(self, context, **kwargs):
+        session = kwargs.get("session_id")
+        if context.context.event is not self.event:
+            return "消息未发送：调用不属于本轮。"
+        session = session.strip() if isinstance(session, str) else ""
+        source = self.event.unified_msg_origin.split(":", 2)
+        target = session.split(":", 2)
+        same_group = (
+            len(target) == 3
+            and target[:2] == source[:2]
+            and target[2].rsplit("_", 1)[-1] == str(self.event.get_group_id())
+        )
+        if not session or session == self.event.unified_msg_origin or same_group:
+            return "消息未发送：回复当前会话请直接输出正文，此工具只用于其他会话。"
+        kwargs["session_id"] = session
+        return await self.original.call(context, **kwargs)
+
+
+class GroupImageTool(FunctionTool):
+    """Send a request-visible image through the current event transport."""
+
+    def __init__(self, event, callback):
+        super().__init__(
+            name="send_group_image",
+            description=(
+                "将当前群聊上下文中的原图发送到当前会话。media_id 原样取自消息中的 [media_id=...]。"
+                "图片 ID 不是文件路径，不要猜 /temp 路径。引用或重发群友图片优先使用此工具；"
+                "它不收藏图片，不生成新图。以返回结果确认是否真正发送成功。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"media_id": {"type": "string", "description": "当前上下文中的图片 ID。"}},
+                "required": ["media_id"],
+                "additionalProperties": False,
+            },
+        )
+        self.event, self.callback = event, callback
+
+    async def call(self, context, **kwargs):
+        """Resolve and send one image belonging to this request.
+
+        Args:
+            context: The current agent tool context.
+            **kwargs: A single media_id from the visible context.
+
+        Returns:
+            A delivery confirmation or a factual failure description.
+        """
+        from astrbot.core.message.components import Image
+        from astrbot.core.message.message_event_result import MessageChain
+
+        if context.context.event is not self.event or set(kwargs) != {"media_id"}:
+            return "图片未发送：调用不属于本轮，或参数不正确。"
+        mid = kwargs["media_id"]
+        if not isinstance(mid, str) or not mid.strip():
+            return "图片未发送：media_id 必须是当前上下文中的图片 ID。"
+        try:
+            data = await self.callback(mid.strip())
+            if not data:
+                return "图片未发送：该 ID 不在本轮上下文中，或原图已失效。不要猜测文件路径。"
+            await self.event.send(MessageChain([Image.fromBase64(data.split(",", 1)[1])]))
+        except Exception as exc:
+            return "图片未发送：传输失败（" + type(exc).__name__ + "）。"
+        return "原图已成功发送到当前会话；这不代表已收藏。"
+
+
 class GroupHistoryTool(FunctionTool):
     """Request-bound history; callers cannot supply a room or session key."""
 
@@ -386,23 +465,44 @@ class AstrBotGateway:
 
     def filter_tools(self, event, req):
         cfg = self.context.get_config(umo=event.unified_msg_origin)
-        if not req.func_tool or computer_tools_allowed(event, cfg):
+        if not req.func_tool:
             return
         removed = [
             tool
             for tool in req.func_tool.tools
-            if type(tool).__module__.startswith("astrbot.core.tools.computer_tools.")
-            or tool.name in {"astrbot_shell_session", "astrbot_execute_shell", "astrbot_execute_python"}
+            if not computer_tools_allowed(event, cfg)
+            and (
+                type(tool).__module__.startswith("astrbot.core.tools.computer_tools.")
+                or tool.name in {"astrbot_shell_session", "astrbot_execute_shell", "astrbot_execute_python"}
+            )
         ]
         if removed:
             # Copy the request's set. Never edit shared managers or tool objects.
             req.func_tool = ToolSet([tool for tool in req.func_tool.tools if tool not in removed])
             self.logger.info("[NativeMM] 按本轮权限移除工具=%s", [tool.name for tool in removed])
+        if event.get_group_id() and (original := req.func_tool.get_tool("send_message_to_user")):
+            req.func_tool = ToolSet(
+                [tool for tool in req.func_tool.tools if tool.name != "send_message_to_user"]
+                + [OtherSessionMessageTool(event, original)]
+            )
 
     @staticmethod
     def add_poke_tool(event, req, callback):
         tools = ToolSet(list(req.func_tool.tools) if req.func_tool else [])
         tools.add_tool(CurrentSenderPokeTool(event, callback))
+        req.func_tool = tools
+
+    @staticmethod
+    def add_image_tool(event, req, callback):
+        """Attach an image sender without changing the shared tool registry.
+
+        Args:
+            event: The current message event.
+            req: The request receiving the tool.
+            callback: An async resolver for request-visible image IDs.
+        """
+        tools = ToolSet(list(req.func_tool.tools) if req.func_tool else [])
+        tools.add_tool(GroupImageTool(event, callback))
         req.func_tool = tools
 
     @staticmethod
@@ -670,6 +770,20 @@ class TransportTracker:
             if not self.bot_original:
                 await self._ack(receipt, result, chain)
             return result
+
+    async def send_late(self, chain):
+        """Reuse this turn's ACK ledger without reinstalling event wrappers."""
+        if not self.bot_original:
+            return await self.send(chain)
+        from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+
+        return await AiocqhttpMessageEvent.send_message(
+            bot=self.bot_proxy,
+            message_chain=guard_chain(chain),
+            event=getattr(self.event.message_obj, "raw_message", None),
+            is_group=True,
+            session_id=str(self.event.get_group_id()),
+        )
 
     def restore(self):
         if self.bot_original is not None and self.event.bot is self.bot_proxy:

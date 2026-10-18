@@ -1,0 +1,22 @@
+{
+  "plugin": "astrbot_plugin_meme_manager",
+  "version": "5.0.7",
+  "files": {
+    "main.py": {
+      "before": "553a4d678022828c01aee1ac885bd9906e0e946b8a94571a74dbd4e1340a3ab9",
+      "after": "e62b207e3d8727f14abbbcdc38a34ae11ecacdb6472188b3b5f70eb91d76995b"
+    },
+    "mixins/event_handlers.py": {
+      "before": "9dc991c4e38cb45fd5b7478f5236376dc8e992113bdaf9b38f3d6a0059fa8bd0",
+      "after": "230b5430e56e9d4c00b4fc24904afafb5d88a093e2b01d1477da56daec1b5f55"
+    },
+    "backend/deferred_reply.py": {
+      "before": null,
+      "after": "0eb08014c87342481e63131757bfe19c36bba00ee03e701f0b26db12fd3c0cfa"
+    },
+    "tests/test_deferred_replies.py": {
+      "before": null,
+      "after": "dd890a722e45bd46a41de49d971b308453ca505c3403597e033c8c328f4120c1"
+    }
+  }
+}
