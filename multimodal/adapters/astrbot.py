@@ -253,21 +253,26 @@ class OtherSessionMessageTool(FunctionTool):
 
     def __init__(self, event, original):
         parameters = copy.deepcopy(original.parameters)
-        parameters["required"] = list(dict.fromkeys(parameters.get("required", []) + ["session_id"]))
+        target_field = next(k for k in ("session", "session_id") if k in parameters["properties"])
+        parameters["required"] = list(dict.fromkeys(parameters.get("required", []) + [target_field]))
+        parameters["properties"][target_field]["description"] = "必须明确指定其他会话，不能是当前群。"
         super().__init__(
             name="send_message_to_other_session",
-            description="仅在明确要求向其他会话发送消息时使用。必须提供其他会话的 session_id。回复当前群请直接输出正文。",
+            description="仅在明确要求向其他会话发送消息时使用。必须提供其他会话的目标标识。回复当前群请直接输出正文。",
             parameters=parameters,
         )
         self.event, self.original = event, original
+        self.target_field = target_field
 
     async def call(self, context, **kwargs):
-        session = kwargs.get("session_id")
+        session = kwargs.get(self.target_field)
         if context.context.event is not self.event:
             return "消息未发送：调用不属于本轮。"
         session = session.strip() if isinstance(session, str) else ""
         source = self.event.unified_msg_origin.split(":", 2)
         target = session.split(":", 2)
+        if ":" not in session and len(source) == 3:
+            target = source[:2] + [session]
         same_group = (
             len(target) == 3
             and target[:2] == source[:2]
@@ -275,7 +280,7 @@ class OtherSessionMessageTool(FunctionTool):
         )
         if not session or session == self.event.unified_msg_origin or same_group:
             return "消息未发送：回复当前会话请直接输出正文，此工具只用于其他会话。"
-        kwargs["session_id"] = session
+        kwargs[self.target_field] = session
         return await self.original.call(context, **kwargs)
 
 

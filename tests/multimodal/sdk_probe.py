@@ -770,6 +770,9 @@ async def main():
 
             marker = '[戳一戳事件={"actor_id":"67890","target_id":"12345"}]'
             toolset.add_tool(SendMessageToUserTool())
+            session_field = (
+                "session" if "session" in SendMessageToUserTool().parameters["properties"] else "session_id"
+            )
             context.send_message = AsyncMock(return_value=True)
             plugin.config.update(
                 enable_poke_after_reply=True, poke_after_reply_probability=1, poke_after_reply_delay=0
@@ -801,7 +804,7 @@ async def main():
                         tools_call_args=[
                             {
                                 "messages": [{"type": "plain", "text": marker + "正文"}],
-                                "session_id": query.unified_msg_origin,
+                                session_field: query.unified_msg_origin,
                             }
                         ],
                         tools_call_ids=["call-send"],
@@ -1154,6 +1157,31 @@ async def main():
                 == "fixture cross-session delivery"
             )
             assert original.parameters["required"] == []
+            real_bound = OtherSessionMessageTool(query, SendMessageToUserTool())
+            assert set(real_bound.parameters["required"]) <= set(real_bound.parameters["properties"])
+            ctx = SimpleNamespace(
+                context=SimpleNamespace(event=query, context=RequestContext(context, query))
+            )
+            for session in [query.unified_msg_origin, "999_" + query.get_group_id()]:
+                assert "未发送" in await real_bound.call(
+                    ctx, **{real_bound.target_field: session}, messages=[{"type": "plain", "text": "fixture"}]
+                )
+            other_session = prefix + ":999_99999"
+            before = context.send_message.await_count
+            with patch.object(query, "role", "member"):
+                await real_bound.call(
+                    ctx,
+                    **{real_bound.target_field: other_session},
+                    messages=[{"type": "plain", "text": "fixture"}],
+                )
+            assert context.send_message.await_count == before
+            with patch.object(query, "role", "admin"):
+                result = await real_bound.call(
+                    ctx,
+                    **{real_bound.target_field: other_session},
+                    messages=[{"type": "plain", "text": "fixture"}],
+                )
+            assert "Message sent" in result and context.send_message.await_count == before + 1
             results["ordinary_reply_tool_replaced_and_cross_session_capability_preserved"] = True
 
             context.get_using_provider_async.return_value = provider

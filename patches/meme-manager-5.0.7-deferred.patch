@@ -17,7 +17,18 @@
  
      async def initialize(self) -> None:
          """Start collection on plugin reload as well as initial startup."""
-@@ -987,6 +990,7 @@
+@@ -761,6 +764,10 @@
+     def _resolve_runtime_pack_context(
+         self, event: AstrMessageEvent | None = None, req: ProviderRequest | None = None
+     ) -> dict:
++        if event is not None and event.get_extra("meme_manager_deferred_worker"):
++            snapshot = event.get_extra("meme_manager_deferred_pack_context")
++            if isinstance(snapshot, dict):
++                return snapshot
+         from .backend.packs.resolver import resolve_pack_context
+ 
+         session_id = ""
+@@ -987,6 +994,7 @@
              return dumps_result({"ok": False, "reason": "语义查询失败"})
  
      async def terminate(self):
@@ -35,34 +46,42 @@
  from ..backend.meme_parser.text_safety import (
      _protected_reference_spans,
      strip_internal_image_ref_lines,
-@@ -1046,6 +1047,26 @@
+@@ -1046,6 +1047,34 @@
          if not response or not response.completion_text:
              return
  
 +        if event.get_extra("meme_manager_defer_selection") and callable(
 +            event.get_extra("meme_manager_deferred_send")
 +        ):
++            pack_context = self._resolve_runtime_pack_context(event=event)
++            mapping = runtime_category_mapping(pack_context.get("category_mapping") or self.category_mapping)
++
++            def clean(text):
++                parser = self._make_meme_parser(mapping, semantic=self._semantic_mode_active(event), final_cleanup=True)
++                return self._clean_outgoing_plain_text(parser.feed(text or "") + parser.finish())
++
 +            # Intermediate tool responses are not the final visible reply.
 +            if response.tools_call_name:
-+                response.completion_text = self._clean_outgoing_plain_text(response.completion_text)
++                response.completion_text = clean(response.completion_text)
 +                return
-+            visible = self._clean_outgoing_plain_text(response.completion_text).strip()
++            visible = clean(response.completion_text).strip()
 +            if visible:
 +                if not event.get_extra(JOB_KEY):
 +                    worker_event = SnapshotEvent(event)
++                    worker_event.set_extra("meme_manager_deferred_pack_context", copy.deepcopy(pack_context))
 +                    event.set_extra(JOB_KEY, DeferredReply(worker_event, copy.deepcopy(response)))
 +                    event.set_extra("meme_manager_text_delivered", False)
 +                response.completion_text = visible
 +                if response.result_chain:
 +                    for component in response.result_chain.chain:
 +                        if isinstance(component, Plain):
-+                            component.text = self._clean_outgoing_plain_text(component.text)
++                            component.text = clean(component.text)
 +                return
 +
          text = response.completion_text
          cleaned_text = strip_internal_image_ref_lines(text)
          if cleaned_text != text:
-@@ -1237,6 +1258,9 @@
+@@ -1237,6 +1266,9 @@
                          cleaned_components.append(component)
  
              # 流式结果同样需要最后一道 Plain 文本清理。
@@ -72,7 +91,7 @@
              if result.result_content_type == ResultContentType.STREAMING_FINISH:
                  if isinstance(original_chain, (str, MessageChain, list)):
                      result.chain = cleaned_components
-@@ -1406,6 +1430,9 @@
+@@ -1406,6 +1438,9 @@
      @filter.after_message_sent()
      async def _after_message_sent_impl(self, event: AstrMessageEvent):
          """消息发送后处理。用于发送未混合的表情图片。"""
@@ -82,7 +101,7 @@
          pending_images = event.get_extra("meme_manager_pending_images")
  
          try:
-@@ -1571,7 +1598,7 @@
+@@ -1571,7 +1606,7 @@
  
      async def _send_meme_image(self, event: AstrMessageEvent, image: Image) -> None:
          image = await self._ensure_image_send_format(image)
@@ -204,7 +223,7 @@
 +        await asyncio.gather(*tasks, return_exceptions=True)
 --- /dev/null
 +++ b/tests/test_deferred_replies.py
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,196 @@
 +import asyncio
 +from types import SimpleNamespace
 +from unittest.mock import AsyncMock
@@ -236,6 +255,7 @@
 +    sender._deferred_meme_tasks = set()
 +    sender._deferred_meme_closing = False
 +    sender.filter_all_tags = False
++    sender.remove_invalid_alternative_markup = False
 +    state = {
 +        LLM_REQUEST_ORIGIN_EXTRA_KEY: "chat",
 +        "meme_manager_defer_selection": True,
@@ -304,6 +324,17 @@
 +    sender._send_meme_image.assert_awaited_once()
 +    assert sender._send_meme_image.await_args.args[0] is job.event
 +    assert "found_emotions" not in state
++
++
++@pytest.mark.asyncio
++async def test_semantic_references_are_hidden_but_code_examples_survive(deferred):
++    sender, event, state = deferred
++    sender._semantic_mode_active = lambda event: True
++    mid = "meme:0123456789abcdef"
++    response = LLMResponse(role="assistant", completion_text=f"正文 {mid}\n`{mid}`")
++    await sender._resp_impl(event, response)
++    assert response.completion_text == f"正文 \n`{mid}`"
++    assert state[JOB_KEY].response.completion_text == f"正文 {mid}\n`{mid}`"
 +
 +
 +@pytest.mark.asyncio
