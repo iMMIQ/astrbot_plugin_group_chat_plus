@@ -189,7 +189,9 @@ def search(events, profiles, *, source, limit=20, before_id=None, keyword="", se
     )
 
 
-def semantic_select(events, profiles, ranked_hits, *, source, limit=20, keyword="", resolved=None, tz=timezone.utc):
+def semantic_select(
+    events, profiles, ranked_hits, *, source, limit=20, keyword="", resolved=None, tz=timezone.utc
+):
     by_seq = {event["seq"]: event for event in events}
     chosen = []
     scores = {}

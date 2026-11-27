@@ -204,8 +204,22 @@ def test_semantic_select_formats_ranked_results():
 
     profiles = {"100": {"sender_id": "100", "names": ["小明"]}}
     events = [
-        {"seq": 1, "sender": "100", "name": "小明", "kind": "member", "received": 100, "parts": [{"type": "text", "text": "全仓干进去大A"}]},
-        {"seq": 2, "sender": "100", "name": "小明", "kind": "member", "received": 200, "parts": [{"type": "text", "text": "中午吃沙县"}]},
+        {
+            "seq": 1,
+            "sender": "100",
+            "name": "小明",
+            "kind": "member",
+            "received": 100,
+            "parts": [{"type": "text", "text": "全仓干进去大A"}],
+        },
+        {
+            "seq": 2,
+            "sender": "100",
+            "name": "小明",
+            "kind": "member",
+            "received": 200,
+            "parts": [{"type": "text", "text": "中午吃沙县"}],
+        },
     ]
     res = semantic_select(events, profiles, [(1, 0.9321)], source="group", limit=5, keyword="梭哈")
     assert res["mode"] == "semantic_search"
