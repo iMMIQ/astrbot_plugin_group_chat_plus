@@ -22,7 +22,7 @@ from .bridge import additions, build_gate_rules, protocol_messages, request_snap
 from .budget import BudgetEstimator, calibrated, profile_key, text_tokens
 from .config import resolve_tz
 from .context import ContextLimit, ContextSelector
-from .history import identity_part, search
+from .history import event_text, filter_eligible, identity_part, search, semantic_select
 from .models import TurnState
 from .output import strip_headers
 from .participation import Participation
@@ -733,12 +733,21 @@ class ConversationService:
                     if len(members) >= 12:
                         break
             result = {"facts": facts, "members": members}
-            cap = int(gcfg.get("room_memory_token_budget", 360) or 360)
-            while result["facts"] and text_tokens(result) > cap:
-                result["facts"].pop(0)
-            while result["members"] and text_tokens(result) > cap:
-                first_k = next(iter(result["members"]))
-                result["members"].pop(first_k, None)
+            cap = int(gcfg.get("room_memory_token_budget", 480) or 480)
+            # Trim members and facts fairly so facts are not wiped to zero by member notes.
+            while text_tokens(result) > cap:
+                if len(result["members"]) > 6 and len(result["members"]) >= len(result["facts"]) * 2:
+                    first_k = next(iter(result["members"]))
+                    result["members"].pop(first_k, None)
+                elif len(result["facts"]) > 2:
+                    result["facts"].pop(0)
+                elif result["members"]:
+                    first_k = next(iter(result["members"]))
+                    result["members"].pop(first_k, None)
+                elif result["facts"]:
+                    result["facts"].pop(0)
+                else:
+                    break
             if result["facts"] or result["members"]:
                 await self.journal.save_room_memory(room, result)
                 self.logger.info(
@@ -822,10 +831,48 @@ class ConversationService:
             profiles = await self.journal.member_identities(anchor, senders)
             tz = resolve_tz(gcfg)
 
-            async def history(source="group", **kwargs):
+            async def history(source="group", mode="literal", **kwargs):
                 if await self.journal.floor(anchor["room"]) >= anchor["seq"]:
                     return {"error": "本群上下文已重置，请重新发起查询。"}
+                if mode not in {"literal", "semantic"}:
+                    return {"error": "mode 必须为 literal 或 semantic。"}
                 if source == "group":
+                    kw = str(kwargs.get("keyword") or "").strip()
+                    if mode == "semantic" and kw and hasattr(self.gateway, "semantic_rank"):
+                        try:
+                            lim = max(1, min(50, int(kwargs.get("limit", 15) or 15)))
+                        except (TypeError, ValueError):
+                            return {"error": "limit 必须是整数。"}
+                        before_id = kwargs.get("before_id")
+                        if before_id is not None:
+                            try:
+                                if isinstance(before_id, bool) or int(before_id) <= 0:
+                                    raise ValueError
+                                before_id = int(before_id)
+                            except (TypeError, ValueError):
+                                return {"error": "before_id 必须是正整数。"}
+                        sender_q = str(kwargs.get("sender") or "").strip().casefold()
+                        all_events, all_profiles = await self.journal.group_events(anchor)
+                        eligible, resolved = filter_eligible(
+                            all_events, all_profiles, before_id=before_id, sender=sender_q
+                        )
+                        items = []
+                        for ev in eligible:
+                            txt = f"{ev['name']}: {event_text(ev)}".strip()
+                            if len(txt) > len(ev["name"]) + 2:
+                                items.append((ev["seq"], txt))
+                        ranked = await self.gateway.semantic_rank(kw, items, top_k=lim)
+                        if ranked:
+                            return semantic_select(
+                                eligible,
+                                all_profiles,
+                                ranked,
+                                source="group",
+                                limit=lim,
+                                keyword=kw,
+                                resolved=resolved,
+                                tz=tz,
+                            )
                     return await self.journal.group_history(anchor, tz=tz, **kwargs)
                 if source != "session":
                     return {"error": "source 必须为 group 或 session。"}

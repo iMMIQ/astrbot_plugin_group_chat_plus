@@ -327,7 +327,7 @@
   "room_memory_token_budget": {
     "description": "每群长期印象的最大估算 token 上限",
     "type": "int",
-    "default": 360
+    "default": 480
   },
   "room_memory_ttl_days": {
     "description": "群聊长期印象保留天数",

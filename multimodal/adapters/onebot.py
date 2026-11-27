@@ -4,12 +4,137 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import uuid
 
 from ..models import RoomId
 from ..qq_faces import face_label
 from .poke import notice as poke_notice
+
+
+def _safe_http_url(value) -> str:
+    s = str(value or "").strip()
+    return s[:400] if s.startswith(("http://", "https://")) else ""
+
+
+def _safe_basename(value) -> str:
+    s = str(value or "").strip()
+    if not s or s.startswith(("http://", "https://", "data:", "base64://")):
+        return ""
+    return os.path.basename(s.replace("\\", "/"))[:120]
+
+
+def _human_size(value) -> str:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return ""
+    if n <= 0:
+        return ""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return ""
+
+
+def extract_json_card(raw) -> str | None:
+    """Extract readable title/desc/URL from a QQ JSON share card (pure data)."""
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            return None
+    elif isinstance(raw, dict):
+        obj = raw
+    else:
+        return None
+    if not isinstance(obj, dict):
+        return None
+
+    prompt = str(obj.get("prompt") or "").strip()
+    meta = obj.get("meta") if isinstance(obj.get("meta"), dict) else {}
+    tag = ""
+    title = ""
+    desc = ""
+    urls: list[str] = []
+
+    def _collect(node, depth=0):
+        nonlocal tag, title, desc
+        if depth > 4 or not isinstance(node, dict):
+            return
+        if not tag:
+            for k in ("tag", "sourceName", "appName"):
+                v = node.get(k)
+                if isinstance(v, str) and v.strip():
+                    tag = v.strip()[:40]
+                    break
+        if not title:
+            for k in ("title", "news_title", "subject"):
+                v = node.get(k)
+                if isinstance(v, str) and v.strip():
+                    title = v.strip()[:120]
+                    break
+        if not desc:
+            for k in ("desc", "summary", "content", "subtitle"):
+                v = node.get(k)
+                if isinstance(v, str) and v.strip():
+                    desc = v.strip()[:180]
+                    break
+        for k in ("qqdocurl", "jumpUrl", "pcJumpUrl", "url", "musicUrl", "source_url", "docurl"):
+            u = _safe_http_url(node.get(k))
+            if u and u not in urls:
+                urls.append(u)
+        for v in node.values():
+            if isinstance(v, dict):
+                _collect(v, depth + 1)
+
+    _collect(meta)
+    parts: list[str] = []
+    if tag:
+        parts.append(tag)
+    if title and title != tag:
+        parts.append(title)
+    if desc and desc not in (title, tag):
+        parts.append(desc)
+    if not parts and prompt:
+        parts.append(prompt[:160])
+    if urls:
+        parts.append("链接: " + urls[0])
+    if not parts:
+        return None
+    return "[QQ分享卡片] " + " | ".join(parts)[:500]
+
+
+def extract_file_label(part, *, fetched_url: str = "") -> str:
+    name = _safe_basename(field(part, "name", "") or field(part, "file", "")) or "未命名文件"
+    size = _human_size(field(part, "file_size", "") or field(part, "size", ""))
+    fid = str(field(part, "file_id", "") or "").strip()[:80]
+    url = _safe_http_url(fetched_url or field(part, "url", ""))
+    bits = [f"name={name}"]
+    if size:
+        bits.append(f"size={size}")
+    if fid:
+        bits.append(f"file_id={fid}")
+    if url:
+        bits.append(f"url={url}")
+    return "[群文件 " + " ".join(bits) + "]"
+
+
+def extract_media_label(kind: str, part) -> str:
+    label = "群视频" if kind == "video" else "群语音"
+    name = _safe_basename(field(part, "name", "") or field(part, "file", ""))
+    url = _safe_http_url(field(part, "url", ""))
+    bits = []
+    if name:
+        bits.append(f"file={name}")
+    if url:
+        bits.append(f"url={url}")
+    return f"[{label} " + " ".join(bits) + "]" if bits else f"[{label}]"
 
 
 def room_key(event) -> RoomId:
@@ -145,6 +270,23 @@ class PlatformAdapter:
                 result.append({"type": "text", "text": face_label(field(part, "id", ""))})
             elif kind == "poke" and (poke := poke_notice(event)):
                 result.append(poke)
+            elif kind == "json":
+                card = extract_json_card(field(part, "data", "") or part)
+                if card:
+                    result.append({"type": "text", "text": card})
+                else:
+                    result.append({"type": "unavailable", "kind": kind, "reason": "empty_card"})
+            elif kind == "file":
+                fetched_url = _safe_http_url(field(part, "url", ""))
+                fid = str(field(part, "file_id", "") or "").strip()
+                gid = str(event.get_group_id() or "")
+                if not fetched_url and fid and gid.isdecimal():
+                    resp = await self._action(event, "get_group_file_url", group_id=int(gid), file_id=fid)
+                    if isinstance(resp, dict):
+                        fetched_url = _safe_http_url(resp.get("url", ""))
+                result.append({"type": "text", "text": extract_file_label(part, fetched_url=fetched_url)})
+            elif kind in {"video", "record"}:
+                result.append({"type": "text", "text": extract_media_label(kind, part)})
             else:
                 result.append({"type": "unavailable", "kind": kind, "reason": "unsupported_modality"})
         return result

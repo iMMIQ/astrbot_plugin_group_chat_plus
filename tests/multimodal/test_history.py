@@ -164,3 +164,51 @@ def test_large_names_and_messages_fit_tail_and_tool_budgets():
     result = search(events, profiles, source="group", limit=50)
     assert text_tokens(result) < 6500
     assert result["has_more"] and result["next_before_id"] > 1
+
+
+def test_onebot_json_card_file_and_media_labels():
+    from multimodal.adapters.onebot import extract_file_label, extract_json_card, extract_media_label
+
+    bili_card = json.dumps(
+        {
+            "app": "com.tencent.structmsg",
+            "prompt": "[QQ小程序]哔哩哔哩",
+            "meta": {
+                "detail_1": {
+                    "title": "哔哩哔哩",
+                    "desc": "【硬核评测】RTX 6090 首发实测",
+                    "qqdocurl": "https://b23.tv/abc123",
+                }
+            },
+        },
+        ensure_ascii=False,
+    )
+    out = extract_json_card(bili_card)
+    assert out is not None
+    assert "[QQ分享卡片]" in out and "RTX 6090" in out and "https://b23.tv/abc123" in out
+    assert extract_json_card("not json") is None
+
+    flabel = extract_file_label(
+        {"data": {"name": "/etc/passwd/report.pdf", "file_size": 204800, "file_id": "fid_1"}},
+        fetched_url="https://example.com/report.pdf",
+    )
+    assert "name=report.pdf" in flabel and "/etc" not in flabel and "200.0KB" in flabel
+    assert "url=https://example.com/report.pdf" in flabel
+
+    vlabel = extract_media_label("video", {"data": {"file": "/tmp/a.mp4", "url": "https://v.test/a.mp4"}})
+    assert "[群视频" in vlabel and "file=a.mp4" in vlabel and "/tmp" not in vlabel
+
+
+def test_semantic_select_formats_ranked_results():
+    from multimodal.history import semantic_select
+
+    profiles = {"100": {"sender_id": "100", "names": ["小明"]}}
+    events = [
+        {"seq": 1, "sender": "100", "name": "小明", "kind": "member", "received": 100, "parts": [{"type": "text", "text": "全仓干进去大A"}]},
+        {"seq": 2, "sender": "100", "name": "小明", "kind": "member", "received": 200, "parts": [{"type": "text", "text": "中午吃沙县"}]},
+    ]
+    res = semantic_select(events, profiles, [(1, 0.9321)], source="group", limit=5, keyword="梭哈")
+    assert res["mode"] == "semantic_search"
+    assert res["keyword_matched"] is True
+    assert len(res["messages"]) == 1
+    assert res["messages"][0]["id"] == 1 and res["messages"][0]["score"] == 0.9321
