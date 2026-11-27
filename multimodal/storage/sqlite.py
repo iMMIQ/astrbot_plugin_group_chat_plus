@@ -21,6 +21,9 @@ class SQLiteRepository:
         self.db = sqlite3.connect(root / "events.sqlite3", timeout=10)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=NORMAL")
+        self.db.execute("PRAGMA busy_timeout=10000")
+        self.db.execute("PRAGMA temp_store=MEMORY")
         self.db.execute("PRAGMA foreign_keys=ON")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
         if version > 3:
@@ -44,6 +47,7 @@ class SQLiteRepository:
                 UNIQUE(room, event_id)
             );
             CREATE INDEX IF NOT EXISTS event_room_seq ON events(room, seq);
+            CREATE INDEX IF NOT EXISTS event_room_kind_sender_seq ON events(room, kind, sender, seq);
             CREATE INDEX IF NOT EXISTS event_sender_time ON events(room, sender, received);
             CREATE INDEX IF NOT EXISTS event_retention ON events(received);
             CREATE TABLE IF NOT EXISTS media (
@@ -144,6 +148,11 @@ class SQLiteRepository:
                 );
                 CREATE INDEX IF NOT EXISTS diagnostic_scope ON diagnostics(room,scope,phase,id);
                 CREATE INDEX IF NOT EXISTS diagnostic_provider ON diagnostics(scope,phase,id);
+                CREATE TABLE IF NOT EXISTS room_memory (
+                    room TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    updated REAL NOT NULL
+                );
             """.split(";"):
                 if statement.strip():
                     self.db.execute(statement)
@@ -260,12 +269,54 @@ class SQLiteRepository:
         row = self.db.execute("SELECT floor FROM room_state WHERE room=?", (room,)).fetchone()
         return row[0] if row else 0
 
+    def latest_sender_name(self, room: str, sender: str) -> str | None:
+        row = self.db.execute(
+            "SELECT name FROM events WHERE room=? AND kind='member' AND sender=? AND seq>? "
+            "AND name!='' AND name!=sender "
+            "AND (events.parts NOT LIKE '%\"poke\"%' OR EXISTS(SELECT 1 FROM json_each(events.parts) WHERE json_extract(value,'$.type')!='poke')) "
+            "ORDER BY seq DESC LIMIT 1",
+            (room, str(sender), self.floor(room)),
+        ).fetchone()
+        return str(row[0]) if row and row[0] else None
+
+    def count_member_after(self, room: str, seq: int) -> int:
+        row = self.db.execute(
+            "SELECT COUNT(*) FROM events WHERE room=? AND kind='member' AND seq>?",
+            (room, int(seq)),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def room_memory(self, room: str, ttl_seconds: float | None = None):
+        row = self.db.execute(
+            "SELECT payload, updated FROM room_memory WHERE room=?",
+            (room,),
+        ).fetchone()
+        if not row:
+            return None
+        if ttl_seconds and ttl_seconds > 0 and time.time() - float(row["updated"]) > ttl_seconds:
+            return None
+        try:
+            data = json.loads(row["payload"])
+            return data if isinstance(data, dict) else None
+        except ValueError:
+            return None
+
+    def save_room_memory(self, room: str, payload: dict):
+        wire = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        with self.db:
+            self.db.execute(
+                "INSERT INTO room_memory(room, payload, updated) VALUES(?,?,?) "
+                "ON CONFLICT(room) DO UPDATE SET payload=excluded.payload, updated=excluded.updated",
+                (room, wire, time.time()),
+            )
+
     def reset(self, room):
         seq = self.db.execute("SELECT COALESCE(MAX(seq),0) FROM events WHERE room=?", (room,)).fetchone()[0]
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO room_state VALUES(?,?)", (room, seq))
             self.db.execute("DELETE FROM segments WHERE room=?", (room,))
             self.db.execute("DELETE FROM turn_links WHERE room=?", (room,))
+            self.db.execute("DELETE FROM room_memory WHERE room=?", (room,))
         return seq
 
     def recent(self, room, snapshot, since, limit):
@@ -305,8 +356,8 @@ class SQLiteRepository:
         rows = self.db.execute(
             "SELECT sender,name,MAX(seq) AS latest FROM events "
             "WHERE room=? AND kind='member' AND seq>? AND seq<=? "
-            "AND EXISTS(SELECT 1 FROM json_each(events.parts) WHERE json_extract(value,'$.type')!='poke') "
             + sender_clause
+            + " AND (events.parts NOT LIKE '%\"poke\"%' OR EXISTS(SELECT 1 FROM json_each(events.parts) WHERE json_extract(value,'$.type')!='poke'))"
             + " GROUP BY sender,name ORDER BY latest DESC",
             (anchor["room"], self.floor(anchor["room"]), anchor["seq"], *(senders or [])),
         ).fetchall()
@@ -833,3 +884,15 @@ class Journal:
 
     async def publish(self, gid, receipt, parts, self_id, platform_id=None):
         return await self.call("publish", gid, receipt, parts, self_id, platform_id)
+
+    async def latest_sender_name(self, room, sender):
+        return await self.call("latest_sender_name", room, sender)
+
+    async def count_member_after(self, room, seq):
+        return await self.call("count_member_after", room, seq)
+
+    async def room_memory(self, room, ttl_seconds=None):
+        return await self.call("room_memory", room, ttl_seconds)
+
+    async def save_room_memory(self, room, payload):
+        return await self.call("save_room_memory", room, payload)

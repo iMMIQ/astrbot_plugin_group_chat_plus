@@ -136,6 +136,10 @@ class TurnState:
     run_context: Any = None
     public_messages: list[Message] = field(default_factory=list)
     media_leases: list[str] = field(default_factory=list)
+    used_serious_tool: bool = False
+    reply_text_len: int = 0
+    agent_finished: bool = False
+    is_poke_trigger: bool = False
 
 
 def event_order(event: Event) -> tuple[int, int, int]:

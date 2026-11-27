@@ -5,11 +5,12 @@ from __future__ import annotations
 import copy
 import json
 import math
-from datetime import datetime, timezone
+from datetime import datetime
 
 from .adapters.onebot import image_ids
 from .adapters.poke import description as poke_description
 from .budget import text_tokens as text_tokens
+from .config import resolve_tz
 from .models import Selection, event_order
 from .output import strip_headers
 
@@ -63,11 +64,13 @@ class ContextSelector:
                     reasons[event["seq"]] = "same_sender_recent_image"
                     primary.update(mids)
         # A quote of a bot answer also restores the actual sources used in that turn.
-        queue = list(references)
+        # Cap transitive depth so long reply chains never snowball images into ContextLimit.
+        queue = [(ref, 1) for ref in references]
         seen = set()
+        max_imgs = int(self.config.get("max_images", 6))
         while queue and len(seen) < 32:
-            event = queue.pop(0)
-            if event["seq"] in seen:
+            event, depth = queue.pop(0)
+            if event["seq"] in seen or depth > 2:
                 continue
             seen.add(event["seq"])
             parent_seq = event.get("causal_anchor")
@@ -90,10 +93,15 @@ class ContextSelector:
                 source = await self.journal.by_seq(room, seq)
                 if source and source["seq"] <= trigger:
                     selected[seq] = source
-                    protected.add(seq)
-                    primary.update(image_ids(source["parts"]))
-                    reasons[seq] = "referenced_turn_source"
-                    queue.append(source)
+                    src_imgs = set(image_ids(source["parts"]))
+                    if depth == 1:
+                        protected.add(seq)
+                        if not src_imgs or len(primary | src_imgs) <= max_imgs:
+                            primary.update(src_imgs)
+                        reasons[seq] = "referenced_turn_source"
+                        queue.append((source, depth + 1))
+                    else:
+                        reasons.setdefault(seq, "transitive_turn_source")
         # A public reply and its trigger remain a complete turn when trimming.
         seed = {e["seq"] for e in recent} | {trigger}
         for event in list(selected.values()):
@@ -187,7 +195,7 @@ class ContextSelector:
             "event_id": event["event_id"],
             "sender_id": event["sender"],
             "name": event["name"],
-            "time": datetime.fromtimestamp(event["received"], timezone.utc).isoformat(),
+            "time": datetime.fromtimestamp(event["received"], resolve_tz(self.config)).isoformat(),
             "source": event["kind"],
         }
         blocks = [
@@ -237,8 +245,13 @@ class ContextSelector:
         freeze=True,
         frames_override=None,
         contiguous=False,
+        include_images=True,
     ):
-        mids = {mid for event in selection.events for mid in image_ids(event["parts"])}
+        mids = (
+            {mid for event in selection.events for mid in image_ids(event["parts"])}
+            if include_images
+            else set()
+        )
         if mids:
             self.media.lease(mids)
         try:
@@ -250,6 +263,7 @@ class ContextSelector:
                 freeze=freeze,
                 frames_override=frames_override,
                 contiguous=contiguous,
+                include_images=include_images,
             )
         finally:
             if mids:
@@ -265,6 +279,7 @@ class ContextSelector:
         freeze=True,
         frames_override=None,
         contiguous=False,
+        include_images=True,
     ):
         limit = min(int(self.config.get("input_token_budget", 32768)), total_limit or 10**9)
         budget = limit - fixed_tokens
@@ -277,7 +292,9 @@ class ContextSelector:
             {mid for event in selection.events for mid in image_ids(event["parts"])},
         )
 
-        if frames_override is not None:
+        if not include_images:
+            frozen = {}
+        elif frames_override is not None:
             frozen = frames_override
 
         def key(mid):
@@ -287,8 +304,8 @@ class ContextSelector:
         def keys(mids):
             return {key(mid) for mid in mids}
 
-        max_images = int(self.config.get("max_images", 6)) - reserved_images
-        if len(keys(selection.primary_media)) > max_images:
+        max_images = (int(self.config.get("max_images", 6)) - reserved_images) if include_images else 0
+        if include_images and len(keys(selection.primary_media)) > max_images:
             raise ContextLimit("关联图片超过本次上限，请引用具体图片或分批提问。")
         image_costs = {}
         for mid, record in records.items():
@@ -300,14 +317,15 @@ class ContextSelector:
             image_costs[key(mid)] = selection.estimator.image(
                 max(int(self.config.get("image_token_reserve", 1600)), min(tiles, 64) * 256)
             )
-        preferred = set(selection.primary_media)
-        ambient = int(self.config.get("background_images", 2))
+        preferred = set(selection.primary_media) if include_images else set()
+        ambient = int(self.config.get("background_images", 2)) if include_images else 0
         # Keep the oldest prefix stable, rather than rotating background images each turn.
-        for event in selection.events:
-            for mid in image_ids(event["parts"]):
-                if key(mid) not in keys(preferred) and ambient > 0 and len(keys(preferred)) < max_images:
-                    preferred.add(mid)
-                    ambient -= 1
+        if include_images:
+            for event in selection.events:
+                for mid in image_ids(event["parts"]):
+                    if key(mid) not in keys(preferred) and ambient > 0 and len(keys(preferred)) < max_images:
+                        preferred.add(mid)
+                        ambient -= 1
         frames = {}
         for event in selection.events:
             frames[event["seq"]] = frozen.get(event["seq"]) or await self._frame(event, preferred, records)
@@ -324,7 +342,11 @@ class ContextSelector:
             groups.setdefault(parent, []).append(event["seq"])
         mandatory = {seq for group in groups.values() if set(group) & selection.protected for seq in group}
         chosen = set(mandatory)
-        used_images = keys(selection.primary_media) | set().union(*(frame_keys(seq) for seq in chosen))
+        used_images = (
+            (keys(selection.primary_media) | set().union(*(frame_keys(seq) for seq in chosen)))
+            if include_images
+            else set()
+        )
         used_text = sum(text_cost(seq) for seq in chosen)
 
         def cost(text, images):
@@ -388,7 +410,7 @@ class ContextSelector:
                     history.append(wire)
         # An old frame may have omitted an image or captured its pending state.
         # Add the now-required original at the tail, without rewriting that frame.
-        for mid in sorted(selection.primary_media):
+        for mid in sorted(selection.primary_media) if include_images else []:
             if key(mid) not in emitted and records.get(mid) and records[mid]["status"] == "ready":
                 current.append({"type": "text", "text": "[本轮关联原图 media_id=" + mid + "]"})
                 current.extend(await materialize([{"type": "journal_image", "media_id": mid}]))

@@ -110,3 +110,68 @@ def strip_headers(text):
                 break
             end = following
     return "".join(output)
+
+
+def polish_reply_text(text: str, *, strip_trailing_period: bool = False) -> str:
+    """Gently clean short casual chat lines without altering code or structured text."""
+    if not text:
+        return text
+    if "```" in text or "~~~" in text:
+        return text
+    cleaned = text.strip()
+    if (
+        strip_trailing_period
+        and cleaned
+        and "\n" not in cleaned
+        and len(cleaned) <= 25
+        and "http://" not in cleaned
+        and "https://" not in cleaned
+        and cleaned.endswith("。")
+        and not cleaned.endswith("。。")
+        and cleaned.count("。") == 1
+        and len(cleaned) > 1
+    ):
+        cleaned = cleaned[:-1]
+    return cleaned
+
+
+_STRUCTURED_PREFIXES = (
+    "- ",
+    "* ",
+    "• ",
+    "1. ",
+    "1、",
+    "# ",
+    "## ",
+    "### ",
+    "📈",
+    "📉",
+    "💰",
+    "🔍",
+    "⚠️",
+    "📊",
+    "【",
+)
+
+
+def split_reply_bubbles(text: str, *, max_bubbles: int = 4, strip_trailing_period: bool = False) -> list[str]:
+    """Split multi-line casual chat replies into separate short bubbles.
+
+    Preserves fenced code blocks, structured lists/cards, and long prose as-is.
+    """
+    if not text or not text.strip():
+        return [text] if text else []
+    raw = text.strip()
+    if "```" in raw or "~~~" in raw or len(raw) > 220:
+        return [raw]
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return [polish_reply_text(raw, strip_trailing_period=strip_trailing_period)]
+    if any(line.startswith(_STRUCTURED_PREFIXES) for line in lines):
+        return [raw]
+    cap = max(1, int(max_bubbles or 4))
+    if len(lines) > cap:
+        lines = lines[: cap - 1] + ["\n".join(lines[cap - 1 :])]
+    return [
+        polish_reply_text(seg, strip_trailing_period=strip_trailing_period) for seg in lines if seg.strip()
+    ]

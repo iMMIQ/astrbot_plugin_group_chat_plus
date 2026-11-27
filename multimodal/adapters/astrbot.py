@@ -234,7 +234,8 @@ class CurrentSenderPokeTool(FunctionTool):
         super().__init__(
             name="native_poke_current_sender",
             description=(
-                "向当前群聊本轮发送者执行一次真实 QQ 戳一戳。仅在确实想戳对方时调用。"
+                "向当前群聊本轮发送者执行一次真实 QQ 戳一戳。日常被戳优先直接用简短文字斗嘴回应，"
+                "不要频繁调用此工具；仅在未自动戳回且你明确想额外反戳对方时才调用。"
                 "无需参数，目标由平台确定。以返回值确认成功，不能用普通聊天文字或事件标记代替动作。"
                 "每轮最多一次，已自动戳回时不会重复。"
             ),
@@ -395,6 +396,9 @@ class AstrBotGateway:
 
         return restore_legacy_wrappers(star_handlers_registry)
 
+    def provider_by_id(self, provider_id):
+        return self.context.get_provider_by_id(provider_id) if provider_id else None
+
     async def provider(self, event):
         provider_id = self.config["provider_id"]
         if provider_id:
@@ -438,8 +442,27 @@ class AstrBotGateway:
         return request
 
     @staticmethod
-    def track_transport(event, journal, gid, on_sent=None):
-        return TransportTracker(event, journal, gid, on_sent)
+    def track_transport(
+        event,
+        journal,
+        gid,
+        on_sent=None,
+        on_send_error=None,
+        *,
+        turn_state=None,
+        config=None,
+        intervening_fn=None,
+    ):
+        return TransportTracker(
+            event,
+            journal,
+            gid,
+            on_sent,
+            on_send_error,
+            turn_state=turn_state,
+            config=config,
+            intervening_fn=intervening_fn,
+        )
 
     def execute(self, event, request, provider, on_stats=None, observer=None):
         return execute(event, self.context, request, provider, on_stats, observer)
@@ -448,6 +471,56 @@ class AstrBotGateway:
     def guard_result(event):
         if result := event.get_result():
             event.set_result(guard_chain(result))
+
+    @staticmethod
+    def decorate_bubbles(event, config):
+        from astrbot.core.message.components import Plain
+
+        from ..output import polish_reply_text, split_reply_bubbles
+
+        result = event.get_result()
+        if not result or not result.is_model_result() or not result.chain:
+            return
+        split_on = bool(config.get("split_newline_bubbles", False))
+        strip_dot = bool(config.get("strip_trailing_period", False))
+        if not split_on and not strip_dot:
+            return
+        max_bubbles = int(config.get("max_reply_bubbles", 4) or 4)
+        new_chain = []
+        for comp in result.chain:
+            if isinstance(comp, Plain):
+                if split_on:
+                    for seg in split_reply_bubbles(
+                        comp.text, max_bubbles=max_bubbles, strip_trailing_period=strip_dot
+                    ):
+                        if seg.strip():
+                            new_chain.append(Plain(seg))
+                else:
+                    cleaned = polish_reply_text(comp.text, strip_trailing_period=strip_dot)
+                    if cleaned.strip():
+                        new_chain.append(Plain(cleaned))
+            else:
+                new_chain.append(comp)
+        if new_chain:
+            result.chain = new_chain
+
+    async def send_bare_text(self, event, text: str) -> str | None:
+        """Send a bare group chat text (no Reply/At) for natural +1 repeats."""
+        from astrbot.core.message.components import Plain
+        from astrbot.core.message.message_event_result import MessageChain
+        from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+
+        chain = MessageChain([Plain(text)])
+        if isinstance(event, AiocqhttpMessageEvent) and getattr(event, "bot", None) is not None:
+            res = await event.bot.send_group_msg(
+                group_id=int(event.get_group_id()),
+                message=[{"type": "text", "data": {"text": text}}],
+            )
+            if isinstance(res, dict) and res.get("message_id") is not None:
+                return str(res["message_id"])
+            return None
+        await event.send(chain)
+        return None
 
     @staticmethod
     def already_handled(event):
@@ -575,6 +648,12 @@ class AstrBotGateway:
 
     def scope_policy(self, event, provider):
         cfg = self.context.get_config(umo=event.unified_msg_origin)
+        runtime = cfg.get("provider_settings", {}).get("computer_use_runtime", "local")
+        effective_role = (
+            getattr(event, "role", None)
+            if (runtime != "none" and computer_tools_allowed(event, cfg))
+            else "member"
+        )
         return {
             "provider": provider.provider_config.get("id"),
             "model": provider.get_model(),
@@ -582,7 +661,7 @@ class AstrBotGateway:
             .get("config", {})
             .get("model", {})
             .get("fallback_provider_ids", []),
-            "role": getattr(event, "role", None),
+            "role": effective_role,
         }
 
     async def summarize(self, event, provider, rules, data):
@@ -603,7 +682,7 @@ class AstrBotGateway:
                     system_prompt=rules,
                     max_tokens=min(2048, int(self.config["summary_token_budget"])),
                 ),
-                15,
+                25,
             )
             if response.usage:
                 stats.token_usage = response.usage
@@ -617,15 +696,45 @@ class AstrBotGateway:
                 response or LLMResponse(role="err", completion_text="summary_failed"),
             )
 
-    async def gate(self, event, provider, history, current):
+    async def distill_memory(self, provider, rules, data):
+        import asyncio
+        import json
+
+        response = await asyncio.wait_for(
+            strict_provider(provider).text_chat(
+                prompt=json.dumps(data, ensure_ascii=False),
+                contexts=[],
+                system_prompt=rules,
+                max_tokens=512,
+            ),
+            25,
+        )
+        return response.completion_text if response else ""
+
+    async def gate(
+        self,
+        event,
+        provider,
+        history,
+        current,
+        *,
+        persona_hint: str = "",
+        react_enabled: bool = False,
+        trigger_hint: str = "",
+    ):
         import asyncio
         import time
 
         from astrbot.core.agent.response import AgentStats
 
-        from ..bridge import GATE_RULES
+        from ..bridge import build_gate_rules
         from ..routing import identity
 
+        rules = build_gate_rules(
+            persona_hint=persona_hint,
+            react_enabled=react_enabled,
+            trigger_hint=trigger_hint,
+        )
         stats = AgentStats()
         started = time.time()
         response = None
@@ -634,7 +743,8 @@ class AstrBotGateway:
                 strict_provider(provider).text_chat(
                     prompt="",
                     contexts=history + [{"role": "user", "content": current}],
-                    system_prompt=GATE_RULES + "\n" + identity(event.get_self_id()),
+                    system_prompt=rules + "\n" + identity(event.get_self_id()),
+                    max_tokens=256,
                 ),
                 15,
             )
@@ -688,9 +798,25 @@ class TransportTracker:
     framework handling while the journal records incomplete delivery.
     """
 
-    def __init__(self, event, journal, gid, on_sent=None):
+    def __init__(
+        self,
+        event,
+        journal,
+        gid,
+        on_sent=None,
+        on_send_error=None,
+        *,
+        turn_state=None,
+        config=None,
+        intervening_fn=None,
+    ):
         self.event, self.journal, self.gid = event, journal, gid
         self.on_sent = on_sent
+        self.on_send_error = on_send_error
+        self.turn_state = turn_state
+        self.config = config
+        self.intervening_fn = intervening_fn
+        self._model_bubbles_sent = 0
         self.original = event.send
         self.previous_override = event.__dict__.get("send")
         self.had_override = "send" in event.__dict__
@@ -744,8 +870,13 @@ class TransportTracker:
         await self.journal.delivery_attempt(self.gid, receipt)
         try:
             result = await original(**kwargs)
-        except BaseException:
+        except BaseException as exc:
             await self.journal.delivery_failed(self.gid, receipt)
+            if self.on_send_error and isinstance(exc, Exception):
+                try:
+                    self.on_send_error(exc)
+                except Exception:
+                    pass
             raise
         parts = kwargs.get("messages", kwargs.get("nodes", [])) if forward else kwargs.get("message", [])
         if forward:
@@ -757,8 +888,72 @@ class TransportTracker:
         )
         return result
 
+    async def _decorate_model_chain(self, chain):
+        import asyncio
+        import random
+
+        from astrbot.core.message.components import At, Plain, Reply
+
+        if not self.config or not self.config.get("smart_reply_decoration", False) or self.turn_state is None:
+            return chain
+        is_model = bool(getattr(chain, "is_model_result", lambda: False)()) or bool(
+            self.turn_state.agent_finished
+        )
+        if not is_model or not getattr(chain, "chain", None):
+            return chain
+
+        # Strip framework-injected Reply / At at the head and the leading "\n" AstrBot prepends after At.
+        body = list(chain.chain)
+        removed_at = False
+        while body and isinstance(body[0], (Reply, At)):
+            if isinstance(body[0], At):
+                removed_at = True
+            body.pop(0)
+        if removed_at and body and isinstance(body[0], Plain):
+            body[0] = Plain(body[0].text.lstrip(" \n"))
+        body = [p for p in body if not (isinstance(p, Plain) and not p.text.strip())]
+        if not body:
+            return chain
+
+        body_text = "".join(p.text for p in body if isinstance(p, Plain)).strip()
+        prefix = []
+        if self._model_bubbles_sent == 0:
+            intervening = 0
+            if self.intervening_fn is not None:
+                try:
+                    intervening = int(await self.intervening_fn())
+                except Exception:
+                    intervening = 0
+            anchor = self.turn_state.selection.anchor
+            anchor_eid = str(anchor.get("event_id", ""))
+            sender_id = str(anchor.get("sender", ""))
+            is_poke = bool(self.turn_state.is_poke_trigger) or not anchor_eid.isdecimal()
+            is_auto = bool(self.turn_state.auto)
+            if is_poke:
+                if intervening >= 2 and sender_id.isdecimal():
+                    prefix.append(At(qq=sender_id))
+                    if isinstance(body[0], Plain) and not body[0].text.startswith(" "):
+                        body[0] = Plain(" " + body[0].text)
+            elif is_auto:
+                if intervening >= 1:
+                    prefix.append(Reply(id=anchor_eid))
+            else:
+                if intervening >= 1 or len(body_text) > 35:
+                    prefix.append(Reply(id=anchor_eid))
+        else:
+            max_delay = float(self.config.get("bubble_typing_delay_max", 1.0) or 0.0)
+            if max_delay > 0 and body_text:
+                delay = min(max_delay, 0.25 + len(body_text) * 0.03) * random.uniform(0.85, 1.15)
+                await asyncio.sleep(delay)
+
+        self._model_bubbles_sent += 1
+        updated = copy.copy(chain)
+        updated.chain = prefix + body
+        return updated
+
     async def send(self, chain):
         chain = guard_chain(chain)
+        chain = await self._decorate_model_chain(chain)
         self.attempts += 1
         receipt = self.gid + ":transport:" + str(self.attempts)
         if not self.bot_original:

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime
 
 TURN_CONTROL = "[native_turn_control]"
+AUTO_REASONS = {"auto_approved", "thread_continue", "nickname_mention", "plus_one_break"}
 
 
 @dataclass(frozen=True)
@@ -13,13 +15,14 @@ class TurnRoute:
     bot_id: str
     source_event_id: str
     reason: str
+    hint: str = ""
 
     @property
     def explicit(self):
-        return self.reason != "auto_approved"
+        return self.reason not in AUTO_REASONS
 
-    def control(self, anchor):
-        return {
+    def control(self, anchor, tz=None):
+        payload = {
             "bot_id": self.bot_id,
             "source_event_id": self.source_event_id,
             "anchor_event_id": anchor["event_id"],
@@ -28,6 +31,13 @@ class TurnRoute:
             "reason": self.reason,
             "participation": "approved",
         }
+        if tz is not None and anchor.get("received"):
+            payload["local_time"] = datetime.fromtimestamp(anchor["received"], tz).strftime(
+                "%Y-%m-%d %H:%M %a"
+            )
+        if self.hint:
+            payload["hint"] = self.hint
+        return payload
 
 
 def classify(anchor, bot_id, *, framework_wake=False, reply_to_bot=False):
@@ -59,8 +69,8 @@ def identity(bot_id):
     )
 
 
-def control_part(route, anchor):
+def control_part(route, anchor, tz=None):
     return {
         "type": "text",
-        "text": TURN_CONTROL + json.dumps(route.control(anchor), ensure_ascii=False, sort_keys=True),
+        "text": TURN_CONTROL + json.dumps(route.control(anchor, tz=tz), ensure_ascii=False, sort_keys=True),
     }

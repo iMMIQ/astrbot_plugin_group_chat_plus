@@ -168,5 +168,175 @@
     "description": "主动参与判断的输入预算；正式回复仍使用完整上下文预算",
     "type": "int",
     "default": 4096
+  },
+  "disabled_groups": {
+    "description": "禁用群号黑名单；优先于启用列表",
+    "type": "list",
+    "default": []
+  },
+  "gate_provider_id": {
+    "description": "主动插话判断模型 ID；留空沿用主模型（建议配快速模型）",
+    "type": "string",
+    "default": ""
+  },
+  "summary_provider_id": {
+    "description": "换段摘要模型 ID；留空沿用主模型（建议配快速模型）",
+    "type": "string",
+    "default": ""
+  },
+  "gate_include_images": {
+    "description": "主动插话判断时是否发送原图；关闭可显著降低超时与预算跳过",
+    "type": "bool",
+    "default": false
+  },
+  "poke_reply_cooldown": {
+    "description": "同群被戳后触发回复的最小冷却（秒）；0 表示不限",
+    "type": "float",
+    "default": 0.0
+  },
+  "mute_backoff_seconds": {
+    "description": "发送触发 QQ 禁言/风控错误(retcode=1200)后的临时退避时长（秒）；0 表示不退避",
+    "type": "int",
+    "default": 1800
+  },
+  "timezone_name": {
+    "description": "群聊时间显示时区（IANA 名称，如 Asia/Shanghai；留空或非法回退 UTC）",
+    "type": "string",
+    "default": "Asia/Shanghai"
+  },
+  "smart_reply_decoration": {
+    "description": "由主控插件按楼层场景接管引用与@（紧贴回复免引用@、插话偏楼仅引用、戳人绝不带假UUID引用）",
+    "type": "bool",
+    "default": false
+  },
+  "split_newline_bubbles": {
+    "description": "将普通聊天回复中的换行拆分为多条短气泡（跳过代码块和长卡片）",
+    "type": "bool",
+    "default": false
+  },
+  "max_reply_bubbles": {
+    "description": "单轮回复最多拆分的短气泡数量",
+    "type": "int",
+    "default": 4
+  },
+  "strip_trailing_period": {
+    "description": "对短促口语单句（<=25字）自动去除孤立尾句号",
+    "type": "bool",
+    "default": false
+  },
+  "bubble_typing_delay_max": {
+    "description": "第2条及后续气泡的最大模拟打字间隔（秒）；首条0延迟发出",
+    "type": "float",
+    "default": 1.0
+  },
+  "thread_continuation_seconds": {
+    "description": "机器人回复后同人免@续聊活跃窗口（秒）；0 表示关闭",
+    "type": "int",
+    "default": 0
+  },
+  "thread_max_turns": {
+    "description": "单段免@续聊最多连续回应轮数",
+    "type": "int",
+    "default": 3
+  },
+  "thread_min_interval_seconds": {
+    "description": "续聊检查最小间隔（秒）",
+    "type": "float",
+    "default": 4.0
+  },
+  "nicknames": {
+    "description": "句中提及外号列表（未@时高概率进入主动判断）",
+    "type": "list",
+    "default": []
+  },
+  "nickname_candidate_probability": {
+    "description": "句中命中外号时进入主动判断的概率（0 到 1）",
+    "type": "float",
+    "default": 0.7
+  },
+  "ignored_bot_ids": {
+    "description": "忽略主动互动的其他机器人 QQ 号列表（防双 Bot 互刷）",
+    "type": "list",
+    "default": []
+  },
+  "input_debounce_seconds": {
+    "description": "显式触发后的短时同人连发合并窗口（秒）；0 表示关闭",
+    "type": "float",
+    "default": 0.0
+  },
+  "auto_stale_max_messages": {
+    "description": "主动插话排队后若群内新增达到此条数则放弃发送；0 表示不限",
+    "type": "int",
+    "default": 4
+  },
+  "auto_stale_max_seconds": {
+    "description": "主动插话超过此秒数未开答则放弃发送；0 表示不限",
+    "type": "float",
+    "default": 20.0
+  },
+  "poke_after_reply_max_chars": {
+    "description": "仅当回复正文不超过此字数且未调用查询工具时才允许回复后随机戳人；0 表示不限",
+    "type": "int",
+    "default": 35
+  },
+  "plus_one_enabled": {
+    "description": "启用零延迟 +1 复读机（连续多位不同群友刷同一短句时自然跟队）",
+    "type": "bool",
+    "default": false
+  },
+  "plus_one_min_users": {
+    "description": "触发 +1 复读所需连续不同群友人数",
+    "type": "int",
+    "default": 3
+  },
+  "plus_one_probability": {
+    "description": "满足 +1 条件时直接跟队复读的概率（0 到 1）",
+    "type": "float",
+    "default": 0.32
+  },
+  "plus_one_break_probability": {
+    "description": "满足 +1 条件时改为交由模型打断队形的概率（0 到 1）",
+    "type": "float",
+    "default": 0.06
+  },
+  "plus_one_cooldown": {
+    "description": "同群 +1 复读冷却时间（秒）",
+    "type": "int",
+    "default": 180
+  },
+  "emoji_react_enabled": {
+    "description": "允许主动判断输出 QQ 贴表情回应（set_msg_emoji_like）",
+    "type": "bool",
+    "default": false
+  },
+  "emoji_react_cooldown": {
+    "description": "同群贴表情回应冷却时间（秒）",
+    "type": "int",
+    "default": 120
+  },
+  "gate_persona_hint": {
+    "description": "注入主动判断模型的简短人设/兴趣提示（1~2句）",
+    "type": "string",
+    "default": ""
+  },
+  "room_memory_enabled": {
+    "description": "启用跨 30 分钟空闲的轻量群聊与人物印象（换段/空闲时后台异步提炼）",
+    "type": "bool",
+    "default": false
+  },
+  "room_memory_token_budget": {
+    "description": "每群长期印象的最大估算 token 上限",
+    "type": "int",
+    "default": 360
+  },
+  "room_memory_ttl_days": {
+    "description": "群聊长期印象保留天数",
+    "type": "int",
+    "default": 7
+  },
+  "group_overrides": {
+    "description": "按群号覆盖配置的 JSON 对象，如 {\"480234482\": {\"auto_candidate_probability\": 0.04}}",
+    "type": "text",
+    "default": "{}"
   }
 }

@@ -8,6 +8,7 @@ import time
 import uuid
 
 from ..models import RoomId
+from ..qq_faces import face_label
 from .poke import notice as poke_notice
 
 
@@ -141,7 +142,7 @@ class PlatformAdapter:
                     )
                 result.append({"type": "forward", "nodes": output, "available": bool(output)})
             elif kind == "face":
-                result.append({"type": "text", "text": "[QQ表情 id=" + str(field(part, "id", "")) + "]"})
+                result.append({"type": "text", "text": face_label(field(part, "id", ""))})
             elif kind == "poke" and (poke := poke_notice(event)):
                 result.append(poke)
             else:
@@ -177,9 +178,13 @@ class PlatformAdapter:
         # Reserve a local arrival time before bounded quote/forward resolution.
         poke = poke_notice(event)
         parts = [poke] if poke else await self.normalize(event, event.get_messages(), room)
-        return await self.journal.add(
-            room, eid, event.get_sender_id(), event.get_sender_name(), parts, received=received
-        )
+        sender = str(event.get_sender_id())
+        name = str(event.get_sender_name() or "")
+        if poke and (not name or name == sender):
+            known = await self.journal.latest_sender_name(room, sender)
+            if known:
+                name = known
+        return await self.journal.add(room, eid, sender, name, parts, received=received)
 
     def cleanup(self):
         active = {entry[0] for entry in self.inflight.values()}

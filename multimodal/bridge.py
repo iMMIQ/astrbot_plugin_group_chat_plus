@@ -6,7 +6,9 @@ import copy
 import json
 from collections import Counter
 
+from .config import resolve_tz
 from .context import text_tokens
+from .qq_faces import REACT_EMOJIS
 from .routing import control_part, identity
 from .segments import digest
 
@@ -39,6 +41,31 @@ GROUP_RULES = (
 )
 
 GATE_RULES = CONTEXT_RULES + '\n判断是否值得主动参与，严格只返回 JSON {"reply":true或false}。不使用工具。'
+
+
+def build_gate_rules(*, persona_hint: str = "", react_enabled: bool = False, trigger_hint: str = "") -> str:
+    lines = [CONTEXT_RULES]
+    if persona_hint and persona_hint.strip():
+        lines.append("你的群友定位：" + persona_hint.strip())
+    if trigger_hint and trigger_hint.strip():
+        lines.append("本轮触发线索：" + trigger_hint.strip())
+    if react_enabled:
+        emojis = "、".join(REACT_EMOJIS.keys())
+        lines.append(
+            "判断是否值得主动参与（不要强行刷屏，像真群友一样有眼力见）：\n"
+            "- reply：确实有好梗可接、对方在续聊/提到你、或值得自然插一句时。\n"
+            "- react：对方发了搞笑内容/晒图/暴论/惨亏/神回复，顺手贴一个QQ表情比硬憋一句话更自然时；"
+            f"emoji 必须从 [{emojis}] 中选一个。\n"
+            "- skip：两人在私聊/正经互答、机器人指令刷屏、没话硬凑或插话会显突兀时。\n"
+            '严格只返回单行 JSON：{"action":"skip"} 或 {"action":"reply"} 或 {"action":"react","emoji":"狗头"}。不使用工具。'
+        )
+    else:
+        lines.append(
+            "判断是否值得主动参与并像真群友一样自然插话（有梗可接、对方在续聊或提到你时才参与；"
+            "两人在正经互答、机器人刷屏或没话硬凑时跳过）。\n"
+            '严格只返回单行 JSON：{"action":"reply"} 或 {"action":"skip"}。不使用工具。'
+        )
+    return "\n".join(lines)
 
 
 def fingerprint(value):
@@ -105,6 +132,8 @@ async def rewrite(
     summarize=None,
     route=None,
     member_context=None,
+    room_memory=None,
+    on_archive=None,
 ):
     extensions = snapshot["framework_extensions"] + additions(req.contexts, snapshot["contexts"])
     extra = list(req.extra_user_content_parts or [])
@@ -118,7 +147,7 @@ async def rewrite(
         elif prompt.strip():
             prompt_additions = [prompt]
     system = (req.system_prompt or "") + "\n\n" + GROUP_RULES
-    control = [control_part(route, selection.anchor)] if route else []
+    control = [control_part(route, selection.anchor, tz=resolve_tz(selector.config))] if route else []
     if route:
         system += "\n" + identity(route.bot_id)
     tools = req.func_tool.openai_schema() if req.func_tool else []
@@ -149,7 +178,14 @@ async def rewrite(
     scope = digest({"system": system, "tools": tools, "policy": scope_policy})
     if segments:
         history, current, canonical = await segments.assemble(
-            selection, scope, fixed, max_input, external_images, summarize
+            selection,
+            scope,
+            fixed,
+            max_input,
+            external_images,
+            summarize,
+            room_memory=room_memory,
+            on_archive=on_archive,
         )
     else:
         history, current = await selector.assemble(

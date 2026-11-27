@@ -50,7 +50,12 @@ def calibrated(config, samples, model=None):
     # The deployed GLM single-call audit found old estimates >= 1.55x
     # actual usage. 0.75 keeps >=16% headroom until live samples are sufficient.
     model = model or config.get("model", "")
-    bootstrap = 0.75 if model == "glm-5.3-flash" else 1.0
+    if model == "glm-5.3-flash":
+        bootstrap = 0.75
+    elif isinstance(model, str) and model.startswith("glm-5"):
+        bootstrap = 0.65
+    else:
+        bootstrap = 1.0
     valid = [
         s
         for s in samples
@@ -63,7 +68,7 @@ def calibrated(config, samples, model=None):
         and s["raw_text_tokens"] >= 512
     ]
     text = [s["input_tokens"] / s["raw_text_tokens"] for s in valid if not s.get("images")]
-    scale = max(0.55, _upper(text)) if len(text) >= MIN_SAMPLES else bootstrap
+    scale = max(0.45, _upper(text)) if len(text) >= MIN_SAMPLES else bootstrap
     # Increase immediately when even one observed call exceeds the estimate.
     if text:
         scale = max(scale, _upper(text))
